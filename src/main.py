@@ -13,7 +13,7 @@ class Tama(QLabel):
         self.is_carrying = False
         self.is_falling = False
 
-        self.front_sprite = self.load_sprite("assets/sprites/cat_front.png")
+        self.front_sprite = self.load_sprite("assets/sprites/cat_front.png", 185)
         self.carry_sprite = self.load_sprite("assets/sprites/cat_carry.png")
         self.falling_sprite = self.load_sprite("assets/sprites/cat_falling.png")
         self.crouch_sprite = self.load_sprite("assets/sprites/cat_crouch.png")
@@ -36,11 +36,13 @@ class Tama(QLabel):
         self.gravity_timer = QTimer(self)
         self.gravity_timer.timeout.connect(self.apply_gravity)
         self.gravity_timer.start(16)
+        self.pose_timer = QTimer(self)
+        self.pose_timer.setSingleShot(True)
 
-    def load_sprite(self, path):
+    def load_sprite(self, path, size=170):
         return QPixmap(path).scaled(
-            170,
-            170,
+            size,
+            size,
             Qt.KeepAspectRatio,
             Qt.SmoothTransformation
         )
@@ -59,6 +61,7 @@ class Tama(QLabel):
         if event.button() == Qt.LeftButton:
             self.is_carrying = True
             self.is_falling = False
+            self.pose_timer.stop()
             self.setPixmap(self.carry_sprite)
 
     def follow_mouse(self):
@@ -120,7 +123,9 @@ class Tama(QLabel):
             desktop.bottom() - crouch_bottom - crouch_offset
         )
 
-        QTimer.singleShot(250, self.stand_left)
+        self.pose_timer.stop()
+        self.pose_timer.timeout.connect(self.stand_left)
+        self.pose_timer.start(250)
 
     def stand_left(self):
         self.setPixmap(self.stand_left_sprite)
@@ -139,6 +144,27 @@ class Tama(QLabel):
             desktop.bottom() - stand_bottom
         )
 
+        self.pose_timer.stop()
+        self.pose_timer.timeout.disconnect()
+        self.pose_timer.timeout.connect(self.face_front)
+        self.pose_timer.start(3000)
+        
+    def face_front(self):
+        self.setPixmap(self.front_sprite)
+
+        front_bottom = self.find_visible_bottom(self.front_sprite)
+
+        screen = QApplication.screenAt(self.pos())
+
+        if screen is None:
+            screen = QApplication.primaryScreen()
+
+        desktop = screen.availableGeometry()
+
+        self.move(
+            self.x(),
+            desktop.bottom() - front_bottom
+        )
 
 app = QApplication(sys.argv)
 
