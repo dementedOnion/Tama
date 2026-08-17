@@ -1,5 +1,6 @@
 import sys
 import signal
+import random
 
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QCursor, QPixmap
@@ -13,13 +14,55 @@ class Tama(QLabel):
         self.is_carrying = False
         self.is_falling = False
 
-        self.front_sprite = self.load_sprite("assets/sprites/cat_front.png", 185)
-        self.carry_sprite = self.load_sprite("assets/sprites/cat_carry.png")
-        self.falling_sprite = self.load_sprite("assets/sprites/cat_falling.png")
-        self.crouch_sprite = self.load_sprite("assets/sprites/cat_crouch.png")
-        self.stand_left_sprite = self.load_sprite("assets/sprites/cat_left_stand.png")
+        # Idle sprites
+        self.sit_front_sprite = self.load_sprite(
+            "assets/sprites/idle/cat_sit_front.png"
+        )
 
-        self.setPixmap(self.front_sprite)
+        self.sit_left_sprite = self.load_sprite(
+            "assets/sprites/idle/cat_sit_left.png"
+        )
+
+        self.sit_right_sprite = self.load_sprite(
+            "assets/sprites/idle/cat_sit_right.png"
+        )
+
+        # Carry / falling / landing sprites
+        self.carry_sprite = self.load_sprite(
+            "assets/sprites/carry/cat_carry.png"
+        )
+
+        self.falling_sprite = self.load_sprite(
+            "assets/sprites/carry/cat_falling.png"
+        )
+
+        self.landing_sprite = self.load_sprite(
+            "assets/sprites/carry/cat_landing.png"
+        )
+
+        # Walking sprites
+        self.walk_left_frames = [
+            self.load_sprite(
+                f"assets/sprites/walk/left/cat_walk_left_{i:02}.png"
+            )
+            for i in range(1, 4)
+        ]
+
+        self.walk_right_frames = [
+            self.load_sprite(
+                f"assets/sprites/walk/right/cat_walk_right_{i:02}.png"
+            )
+            for i in range(1, 4)
+        ]
+
+        # Walking state
+        self.walk_frame_index = 0
+        self.walk_frame_direction = 1
+        self.walk_direction = "left"
+        self.walk_target_x = None
+
+        # Starting pose
+        self.set_sprite(self.sit_front_sprite)
 
         self.setWindowFlags(
             Qt.FramelessWindowHint
@@ -29,23 +72,45 @@ class Tama(QLabel):
 
         self.setAttribute(Qt.WA_TranslucentBackground)
 
+        # Mouse-follow timer
         self.carry_timer = QTimer(self)
         self.carry_timer.timeout.connect(self.follow_mouse)
         self.carry_timer.start(16)
 
+        # Gravity timer
         self.gravity_timer = QTimer(self)
         self.gravity_timer.timeout.connect(self.apply_gravity)
         self.gravity_timer.start(16)
+
+        # Landing / pose timer
         self.pose_timer = QTimer(self)
         self.pose_timer.setSingleShot(True)
 
-    def load_sprite(self, path, size=170):
-        return QPixmap(path).scaled(
-            size,
-            size,
+        # Walking animation timer
+        self.walk_timer = QTimer(self)
+        self.walk_timer.timeout.connect(self.animate_walk)
+
+        # Random idle behaviour timer
+        self.idle_timer = QTimer(self)
+        self.idle_timer.setSingleShot(True)
+        self.idle_timer.timeout.connect(self.choose_next_action)
+
+        # Let Tama begin making her own decisions
+        self.schedule_next_action()
+
+    def load_sprite(self, path):
+        pixmap = QPixmap(path)
+
+        return pixmap.scaled(
+            int(pixmap.width() * 0.7),
+            int(pixmap.height() * 0.7),
             Qt.KeepAspectRatio,
             Qt.SmoothTransformation
         )
+
+    def set_sprite(self, sprite):
+        self.setPixmap(sprite)
+        self.adjustSize()
 
     def find_visible_bottom(self, pixmap):
         image = pixmap.toImage()
@@ -57,27 +122,48 @@ class Tama(QLabel):
 
         return image.height() - 1
 
+    def place_on_ground(self, sprite):
+        screen = QApplication.screenAt(self.pos())
+
+        if screen is None:
+            screen = QApplication.primaryScreen()
+
+        desktop = screen.availableGeometry()
+        visible_bottom = self.find_visible_bottom(sprite)
+
+        self.move(
+            self.x(),
+            desktop.bottom() - visible_bottom
+        )
+
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
             self.is_carrying = True
             self.is_falling = False
+
             self.pose_timer.stop()
-            self.setPixmap(self.carry_sprite)
+            self.walk_timer.stop()
+            self.idle_timer.stop()
+
+            self.walk_target_x = None
+
+            self.set_sprite(self.carry_sprite)
 
     def follow_mouse(self):
         if self.is_carrying:
             cursor_position = QCursor.pos()
 
             self.move(
-                cursor_position.x() - 75,
-                cursor_position.y() - 15
+                cursor_position.x() - 73,
+                cursor_position.y() - 10
             )
 
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.LeftButton:
             self.is_carrying = False
             self.is_falling = True
-            self.setPixmap(self.falling_sprite)
+
+            self.set_sprite(self.falling_sprite)
 
     def apply_gravity(self):
         if not self.is_falling:
@@ -89,11 +175,9 @@ class Tama(QLabel):
             screen = QApplication.primaryScreen()
 
         desktop = screen.availableGeometry()
-
         visible_bottom = self.find_visible_bottom(self.falling_sprite)
 
-        fall_offset = 12
-        ground_y = desktop.bottom() - visible_bottom - fall_offset
+        ground_y = desktop.bottom() - visible_bottom
 
         if self.y() < ground_y:
             self.move(
@@ -105,32 +189,70 @@ class Tama(QLabel):
             self.land()
 
     def land(self):
-        self.setPixmap(self.crouch_sprite)
-
-        crouch_bottom = self.find_visible_bottom(self.crouch_sprite)
-
-        screen = QApplication.screenAt(self.pos())
-
-        if screen is None:
-            screen = QApplication.primaryScreen()
-
-        desktop = screen.availableGeometry()
-
-        crouch_offset = 14
-
-        self.move(
-            self.x(),
-            desktop.bottom() - crouch_bottom - crouch_offset
-        )
+        self.set_sprite(self.landing_sprite)
+        self.place_on_ground(self.landing_sprite)
 
         self.pose_timer.stop()
-        self.pose_timer.timeout.connect(self.stand_left)
+
+        try:
+            self.pose_timer.timeout.disconnect()
+        except RuntimeError:
+            pass
+
+        self.pose_timer.timeout.connect(self.sit_left)
         self.pose_timer.start(250)
 
-    def stand_left(self):
-        self.setPixmap(self.stand_left_sprite)
+    def sit_front(self):
+        self.set_sprite(self.sit_front_sprite)
+        self.place_on_ground(self.sit_front_sprite)
 
-        stand_bottom = self.find_visible_bottom(self.stand_left_sprite)
+        self.schedule_next_action()
+
+    def sit_left(self):
+        self.set_sprite(self.sit_left_sprite)
+        self.place_on_ground(self.sit_left_sprite)
+
+        self.schedule_next_action()
+
+    def sit_right(self):
+        self.set_sprite(self.sit_right_sprite)
+        self.place_on_ground(self.sit_right_sprite)
+
+        self.schedule_next_action()
+
+    def schedule_next_action(self):
+        if self.is_carrying or self.is_falling:
+            return
+
+        wait_time = random.randint(2000, 6000)
+        self.idle_timer.start(wait_time)
+
+    def choose_next_action(self):
+        if self.is_carrying or self.is_falling:
+            return
+
+        choice = random.randint(1, 100)
+
+        # 50% chance Tama simply continues sitting
+        if choice <= 50:
+            self.sit_front()
+            return
+
+        # 25% chance to walk left
+        if choice <= 75:
+            self.start_walk("left")
+            return
+
+        # 25% chance to walk right
+        self.start_walk("right")
+
+    def start_walk(self, direction):
+        if self.is_carrying or self.is_falling:
+            return
+
+        self.walk_direction = direction
+        self.walk_frame_index = 0
+        self.walk_frame_direction = 1
 
         screen = QApplication.screenAt(self.pos())
 
@@ -139,20 +261,57 @@ class Tama(QLabel):
 
         desktop = screen.availableGeometry()
 
-        self.move(
-            self.x(),
-            desktop.bottom() - stand_bottom
-        )
+        distance = random.randint(80, 400)
 
-        self.pose_timer.stop()
-        self.pose_timer.timeout.disconnect()
-        self.pose_timer.timeout.connect(self.face_front)
-        self.pose_timer.start(3000)
-        
-    def face_front(self):
-        self.setPixmap(self.front_sprite)
+        if direction == "left":
+            self.walk_target_x = max(
+                desktop.left(),
+                self.x() - distance
+            )
 
-        front_bottom = self.find_visible_bottom(self.front_sprite)
+        else:
+            right_edge = desktop.right() - self.width() + 1
+
+            self.walk_target_x = min(
+                right_edge,
+                self.x() + distance
+            )
+
+        self.walk_timer.start(140)
+
+    def stop_walking(self):
+        self.walk_timer.stop()
+        self.walk_target_x = None
+
+        if self.walk_direction == "left":
+            self.sit_left()
+        else:
+            self.sit_right()
+
+    def animate_walk(self):
+        if self.is_carrying or self.is_falling:
+            self.walk_timer.stop()
+            return
+
+        if self.walk_direction == "left":
+            frames = self.walk_left_frames
+        else:
+            frames = self.walk_right_frames
+
+        frame = frames[self.walk_frame_index]
+
+        self.set_sprite(frame)
+        self.place_on_ground(frame)
+
+        self.walk_frame_index += self.walk_frame_direction
+
+        if self.walk_frame_index >= len(frames) - 1:
+            self.walk_frame_index = len(frames) - 1
+            self.walk_frame_direction = -1
+
+        elif self.walk_frame_index <= 0:
+            self.walk_frame_index = 0
+            self.walk_frame_direction = 1
 
         screen = QApplication.screenAt(self.pos())
 
@@ -161,10 +320,54 @@ class Tama(QLabel):
 
         desktop = screen.availableGeometry()
 
+        if self.walk_direction == "left":
+            new_x = self.x() - 10
+
+            if new_x <= self.walk_target_x:
+                self.move(
+                    self.walk_target_x,
+                    self.y()
+                )
+
+                self.stop_walking()
+                return
+
+            if new_x <= desktop.left():
+                self.move(
+                    desktop.left(),
+                    self.y()
+                )
+
+                self.stop_walking()
+                return
+
+        else:
+            new_x = self.x() + 10
+            right_edge = desktop.right() - self.width() + 1
+
+            if new_x >= self.walk_target_x:
+                self.move(
+                    self.walk_target_x,
+                    self.y()
+                )
+
+                self.stop_walking()
+                return
+
+            if new_x >= right_edge:
+                self.move(
+                    right_edge,
+                    self.y()
+                )
+
+                self.stop_walking()
+                return
+
         self.move(
-            self.x(),
-            desktop.bottom() - front_bottom
+            new_x,
+            self.y()
         )
+
 
 app = QApplication(sys.argv)
 
