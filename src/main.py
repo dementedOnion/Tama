@@ -2,12 +2,97 @@ import sys
 import signal
 import random
 import ctypes
+from pathlib import Path
 
 from ctypes import wintypes
 
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QCursor, QPixmap
-from PySide6.QtWidgets import QApplication, QLabel
+from PySide6.QtWidgets import QApplication, QLabel, QPushButton
+
+
+def resource_path(relative_path):
+    if hasattr(sys, "_MEIPASS"):
+        base_path = Path(sys._MEIPASS)
+    else:
+        base_path = Path(__file__).resolve().parent.parent
+
+    return base_path / relative_path
+
+
+class CloseButton(QPushButton):
+    def __init__(self):
+        super().__init__("X")
+
+        self.setFixedSize(34, 34)
+
+        self.setWindowFlags(
+            Qt.FramelessWindowHint
+            | Qt.WindowStaysOnTopHint
+            | Qt.Tool
+        )
+
+        self.setStyleSheet(
+            """
+            QPushButton {
+                background-color: white;
+                color: red;
+                border: 2px solid red;
+                border-radius: 4px;
+                font-size: 20px;
+                font-weight: bold;
+            }
+            """
+        )
+
+        self.drag_start = None
+        self.window_start = None
+        self.was_dragged = False
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self.drag_start = event.globalPosition().toPoint()
+            self.window_start = self.pos()
+            self.was_dragged = False
+
+            event.accept()
+            return
+
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if (
+            self.drag_start is not None
+            and event.buttons() & Qt.LeftButton
+        ):
+            current_position = event.globalPosition().toPoint()
+            movement = current_position - self.drag_start
+
+            if movement.manhattanLength() > 3:
+                self.was_dragged = True
+
+            self.move(
+                self.window_start + movement
+            )
+
+            event.accept()
+            return
+
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            if not self.was_dragged:
+                QApplication.instance().quit()
+
+            self.drag_start = None
+            self.window_start = None
+            self.was_dragged = False
+
+            event.accept()
+            return
+
+        super().mouseReleaseEvent(event)
 
 
 class Tama(QLabel):
@@ -221,7 +306,7 @@ class Tama(QLabel):
     # -----------------------------------------------------
 
     def load_sprite(self, path):
-        pixmap = QPixmap(path)
+        pixmap = QPixmap(str(resource_path(path)))
 
         return pixmap.scaled(
             int(pixmap.width() * 0.7),
@@ -542,9 +627,6 @@ class Tama(QLabel):
             ):
                 return True
 
-            # Crucial:
-            # only accept the window if its top edge is
-            # actually exposed at Tama's X position.
             if not self.is_window_exposed_at_x(
                 hwnd,
                 tama_center_x,
@@ -606,22 +688,18 @@ class Tama(QLabel):
 
         hwnd = self.current_surface_hwnd
 
-        # Window was closed.
         if not user32.IsWindow(hwnd):
             self.fall_from_platform()
             return
 
-        # Window was hidden.
         if not user32.IsWindowVisible(hwnd):
             self.fall_from_platform()
             return
 
-        # Window was minimized.
         if user32.IsIconic(hwnd):
             self.fall_from_platform()
             return
 
-        # DWM considers the window hidden/cloaked.
         if self.is_window_cloaked(hwnd):
             self.fall_from_platform()
             return
@@ -640,8 +718,6 @@ class Tama(QLabel):
             + (self.width() // 2)
         )
 
-        # Window was dragged horizontally out
-        # from underneath Tama.
         if not (
             rect.left
             <= tama_center_x
@@ -650,8 +726,6 @@ class Tama(QLabel):
             self.fall_from_platform()
             return
 
-        # Another window is now covering this platform
-        # at Tama's current position.
         if not self.is_window_exposed_at_x(
             hwnd,
             tama_center_x,
@@ -660,8 +734,6 @@ class Tama(QLabel):
             self.fall_from_platform()
             return
 
-        # Platform still exists.
-        # Refresh all of its geometry.
         self.current_surface_y = rect.top
         self.current_surface_left = rect.left
         self.current_surface_right = rect.right
@@ -678,7 +750,6 @@ class Tama(QLabel):
             current_sprite
         )
 
-        # Crouch intentionally sits 20 pixels lower.
         crouch_offset = 0
 
         if (
@@ -693,8 +764,6 @@ class Tama(QLabel):
             + crouch_offset
         )
 
-        # If the window moves vertically,
-        # Tama moves with its top edge immediately.
         self.move(
             self.x(),
             new_y
@@ -1333,8 +1402,6 @@ class Tama(QLabel):
             400
         )
 
-        # On a window, allow target to extend past
-        # the platform so Tama may walk off.
         if (
             self.current_surface_y
             is not None
@@ -1356,7 +1423,6 @@ class Tama(QLabel):
 
             return
 
-        # Taskbar walk stays screen-bound.
         screen = QApplication.screenAt(
             self.pos()
         )
@@ -1412,7 +1478,6 @@ class Tama(QLabel):
             self.get_falling_sprite()
         )
 
-        # Slight downward nudge clears the old surface.
         self.move(
             self.x(),
             self.y() + 2
@@ -1639,5 +1704,18 @@ signal.signal(
 
 tama = Tama()
 tama.show()
+
+close_button = CloseButton()
+
+screen = QApplication.primaryScreen().availableGeometry()
+
+close_button.move(
+    screen.right()
+    - close_button.width()
+    - 20,
+    screen.top() + 20
+)
+
+close_button.show()
 
 sys.exit(app.exec())

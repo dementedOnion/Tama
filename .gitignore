@@ -1,3 +1,6 @@
 .venv/
+build/
+dist/*
+!dist/Tama.exe
 __pycache__/
 *.pyc
