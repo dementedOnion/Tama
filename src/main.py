@@ -1467,6 +1467,15 @@ class Tama(QLabel):
         if self.is_falling:
             return
 
+        if (
+            self.current_surface_hwnd is not None
+            and (
+                self.crouch_timer.isActive()
+                or self.crouch_end_timer.isActive()
+            )
+        ):
+            return
+
         self.walk_timer.stop()
         self.idle_timer.stop()
 
