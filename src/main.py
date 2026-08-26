@@ -10,6 +10,8 @@ from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QCursor, QPixmap
 from PySide6.QtWidgets import QApplication, QLabel, QPushButton
 
+from tama_ui import TamaUI
+
 
 def resource_path(relative_path):
     if hasattr(sys, "_MEIPASS"):
@@ -1704,27 +1706,39 @@ class Tama(QLabel):
         )
 
 
-app = QApplication(sys.argv)
+def main():
+    app = QApplication(sys.argv)
 
-signal.signal(
-    signal.SIGINT,
-    lambda *_: app.quit()
-)
+    signal.signal(
+        signal.SIGINT,
+        lambda *_: app.quit()
+    )
 
-tama = Tama()
-tama.show()
+    tama = Tama()
+    tama.show()
 
-close_button = CloseButton()
+    close_button = CloseButton()
 
-screen = QApplication.primaryScreen().availableGeometry()
+    screen = QApplication.primaryScreen().availableGeometry()
 
-close_button.move(
-    screen.right()
-    - close_button.width()
-    - 20,
-    screen.top() + 20
-)
+    close_button.move(
+        screen.right()
+        - close_button.width()
+        - 20,
+        screen.top() + 20
+    )
 
-close_button.show()
+    close_button.show()
 
-sys.exit(app.exec())
+    tama_ui = TamaUI(resource_path("assets"), tama_window=tama)
+    tama_ui.move(
+        screen.left() + 20,
+        screen.top() + 20
+    )
+    tama_ui.show()
+
+    return app.exec()
+
+
+if __name__ == "__main__":
+    sys.exit(main())
