@@ -69,7 +69,7 @@ class TamaUI(QWidget):
     """The draggable Tamagotchi shell and its food/bed menu."""
 
     OPTIONS = ("food", "bed")
-    UI_SCALE = 0.5
+    UI_SCALE = 0.5 * 0.67
     OBJECT_Y_OFFSETS = {"food": 10, "bed": 20}
     PRESS_DURATION_MS = 140
 
