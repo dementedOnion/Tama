@@ -4,3 +4,5 @@ dist/*
 !dist/Tama.exe
 __pycache__/
 *.pyc
+build312/
+build_runtime/
