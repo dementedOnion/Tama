@@ -2,6 +2,8 @@ import sys
 import signal
 import random
 import ctypes
+import json
+import os
 from pathlib import Path
 
 from ctypes import wintypes
@@ -20,6 +22,128 @@ def resource_path(relative_path):
         base_path = Path(__file__).resolve().parent.parent
 
     return base_path / relative_path
+
+def get_state_file():
+    appdata = os.environ.get("APPDATA")
+
+    if appdata:
+        state_dir = Path(appdata) / "Tama"
+    else:
+        state_dir = Path.home() / ".tama"
+
+    state_dir.mkdir(
+        parents=True,
+        exist_ok=True
+    )
+
+    return state_dir / "state.json"
+
+
+def load_state():
+    state_file = get_state_file()
+
+    if not state_file.exists():
+        return {}
+
+    try:
+        with state_file.open(
+            "r",
+            encoding="utf-8"
+        ) as file:
+            return json.load(file)
+
+    except (
+        OSError,
+        json.JSONDecodeError
+    ):
+        return {}
+
+
+def save_state(tama, tama_ui):
+    state = {
+        "tama": {
+            "x": tama.x(),
+            "y": tama.y(),
+        },
+        "ui": {
+            "x": tama_ui.x(),
+            "y": tama_ui.y(),
+        },
+    }
+
+    state_file = get_state_file()
+
+    try:
+        with state_file.open(
+            "w",
+            encoding="utf-8"
+        ) as file:
+            json.dump(
+                state,
+                file,
+                indent=4
+            )
+
+    except OSError:
+        pass
+
+
+def position_is_on_screen(x, y):
+    for screen in QApplication.screens():
+        if screen.geometry().contains(
+            x,
+            y
+        ):
+            return True
+
+    return False
+
+
+def get_taskbar_horizontal_bounds(x, offscreen_margin=200):
+    """Return the contiguous monitor span containing x,
+    with a small allowed wander area beyond the outer edges.
+    """
+    intervals = sorted(
+        (
+            screen.availableGeometry().left(),
+            screen.availableGeometry().right(),
+        )
+        for screen in QApplication.screens()
+    )
+
+    if not intervals:
+        return x, x
+
+    spans = []
+
+    for left, right in intervals:
+        if spans and left <= spans[-1][1] + 1:
+            spans[-1] = (
+                spans[-1][0],
+                max(spans[-1][1], right),
+            )
+        else:
+            spans.append((left, right))
+
+    for left, right in spans:
+        if left <= x <= right:
+            return (
+                left - offscreen_margin,
+                right + offscreen_margin,
+            )
+
+    nearest_span = min(
+        spans,
+        key=lambda span: min(
+            abs(x - span[0]),
+            abs(x - span[1]),
+        ),
+    )
+
+    return (
+        nearest_span[0] - offscreen_margin,
+        nearest_span[1] + offscreen_margin,
+    )
 
 
 class CloseButton(QPushButton):
@@ -206,6 +330,9 @@ class Tama(QLabel):
         # WALKING
         # -------------------------------------------------
 
+        self.offscreen_decisions = 0
+        self.offscreen_return_after = random.randint(5, 6)
+
         self.walk_left_frames = [
             self.load_sprite(
                 f"assets/sprites/walk/left/cat_walk_left_{i:02}.png"
@@ -226,6 +353,59 @@ class Tama(QLabel):
         self.walk_target_x = None
 
         # -------------------------------------------------
+        # EATING
+        # -------------------------------------------------
+
+        self.eating_left_frames = [
+            self.load_sprite(
+                "assets/sprites/eating/left/eat_left_01.png"
+            ),
+            self.load_sprite(
+                "assets/sprites/eating/left/eat_left_02.png"
+            ),
+        ]
+
+        self.eating_right_frames = [
+            self.load_sprite(
+                "assets/sprites/eating/right/eat_right_01.png"
+            ),
+            self.load_sprite(
+                "assets/sprites/eating/right/eat_right_02.png"
+            ),
+        ]
+
+        self.eating_frames = self.eating_left_frames
+
+        self.is_eating = False
+        self.eat_frame_index = 0
+        self.eat_frames_shown = 0
+
+        # Eating-animation position adjustment.
+        # Positive X = right
+        # Negative X = left
+        # Positive Y = down
+        # Negative Y = up
+        # Eating position offsets.
+        # Positive X = right
+        # Negative X = left
+        # Positive Y = down
+        # Negative Y = up
+
+        self.eating_left_x_offset = -61
+        self.eating_left_y_offset = 10
+
+        self.eating_right_x_offset = 23
+        self.eating_right_y_offset = 10
+
+        # -------------------------------------------------
+        # INTERACTION TARGET
+        # -------------------------------------------------
+
+        self.interaction_target = None
+        self.interaction_target_x = None
+        self.interaction_ui = None
+
+        # -------------------------------------------------
         # WINDOW SETUP
         # -------------------------------------------------
 
@@ -242,6 +422,11 @@ class Tama(QLabel):
         # -------------------------------------------------
         # TIMERS
         # -------------------------------------------------
+
+        self.eating_timer = QTimer(self)
+        self.eating_timer.timeout.connect(
+            self.animate_eating
+        )
 
         self.carry_timer = QTimer(self)
         self.carry_timer.timeout.connect(self.follow_mouse)
@@ -779,6 +964,10 @@ class Tama(QLabel):
         self,
         event
     ):
+        if self.is_eating:
+            event.accept()
+            return
+
         if (
             event.button()
             == Qt.LeftButton
@@ -858,6 +1047,10 @@ class Tama(QLabel):
         self,
         event
     ):
+        if self.is_eating:
+            event.accept()
+            return
+
         if (
             event.button()
             == Qt.LeftButton
@@ -979,6 +1172,10 @@ class Tama(QLabel):
         self.pose_timer.start(250)
 
     def finish_landing(self):
+        if self.interaction_target is not None:
+            self.start_interaction_walk()
+            return
+
         if (
             self.facing_direction
             == "right"
@@ -1068,6 +1265,7 @@ class Tama(QLabel):
             or self.is_falling
             or self.is_sleeping
             or self.is_waking
+            or self.interaction_target is not None
         ):
             return
 
@@ -1080,13 +1278,84 @@ class Tama(QLabel):
             wait_time
         )
 
+    def is_completely_offscreen(self):
+        tama_left = self.x()
+        tama_right = self.x() + self.width()
+
+        for screen in QApplication.screens():
+            area = screen.availableGeometry()
+
+            if (
+                tama_right >= area.left()
+                and tama_left <= area.right()
+            ):
+                return False
+
+        return True
+
     def choose_next_action(self):
         if (
             self.is_carrying
             or self.is_falling
+            or self.interaction_target is not None
         ):
             return
 
+        # If Tama is completely off-screen, let her continue
+        # making normal random decisions for a while.
+        if self.is_completely_offscreen():
+            self.offscreen_decisions += 1
+
+            # She's been fucking around out there long enough.
+            if (
+                self.offscreen_decisions
+                >= self.offscreen_return_after
+            ):
+                self.offscreen_decisions = 0
+                self.offscreen_return_after = random.randint(
+                    5,
+                    6
+                )
+
+                # Work out which direction leads back toward
+                # the nearest monitor.
+                tama_center = (
+                    self.x()
+                    + (self.width() // 2)
+                )
+
+                nearest_screen = min(
+                    QApplication.screens(),
+                    key=lambda screen: min(
+                        abs(
+                            tama_center
+                            - screen.availableGeometry().left()
+                        ),
+                        abs(
+                            tama_center
+                            - screen.availableGeometry().right()
+                        ),
+                    ),
+                )
+
+                area = nearest_screen.availableGeometry()
+
+                if tama_center < area.left():
+                    self.start_walk("right")
+                else:
+                    self.start_walk("left")
+
+                return
+
+        else:
+            # She's visible again, so forget the escape count.
+            self.offscreen_decisions = 0
+            self.offscreen_return_after = random.randint(
+                5,
+                6
+            )
+
+        # Normal Tama brain.
         choice = random.randint(
             1,
             100
@@ -1378,6 +1647,240 @@ class Tama(QLabel):
             self.sit_right()
 
     # -----------------------------------------------------
+    # INTERACTION SEEKING
+    # -----------------------------------------------------
+
+    def seek_interaction(self, interaction_type, target_x, interaction_ui=None):
+        """Stop normal idle behaviour and go to a spawned object."""
+
+        self.interaction_target = interaction_type
+        self.interaction_target_x = target_x
+        self.interaction_ui = interaction_ui
+
+        # Stop Tama choosing unrelated activities.
+        self.idle_timer.stop()
+        self.crouch_start_timer.stop()
+        self.crouch_timer.stop()
+        self.crouch_end_timer.stop()
+
+        self.sleep_timer.stop()
+        self.sleep_end_timer.stop()
+
+        self.is_sleeping = False
+        self.is_waking = False
+
+        self.walk_timer.stop()
+        self.walk_target_x = None
+
+        # If Tama is standing on a program window,
+        # get her down toward the taskbar first.
+        if self.current_surface_y is not None:
+            self.fall_from_platform()
+            return
+
+        self.start_interaction_walk()
+
+    def start_interaction_walk(self):
+        if self.interaction_target is None:
+            return
+
+        if self.interaction_target_x is None:
+            return
+
+        # Aim Tama's centre roughly at the object's centre.
+        target_x = (
+            self.interaction_target_x
+            - (self.width() // 2)
+        )
+
+        if self.interaction_target == "food":
+            food_stop_offset = 95
+
+            if target_x < self.x():
+                target_x += food_stop_offset
+            else:
+                target_x -= food_stop_offset
+
+        self.walk_target_x = target_x
+
+        if target_x < self.x():
+            self.walk_direction = "left"
+            self.facing_direction = "left"
+        else:
+            self.walk_direction = "right"
+            self.facing_direction = "right"
+
+        self.walk_frame_index = 0
+        self.walk_frame_direction = 1
+
+        self.walk_timer.start(140)
+
+    def finish_interaction_walk(self):
+        self.walk_timer.stop()
+        self.walk_target_x = None
+
+        # Food begins its eating animation immediately.
+        if self.interaction_target == "food":
+            tama_center_x = (
+                self.x()
+                + (self.width() // 2)
+            )
+
+            if self.interaction_target_x < tama_center_x:
+                self.facing_direction = "left"
+            else:
+                self.facing_direction = "right"
+
+            self.start_eating()
+            return
+
+        # Other interactions currently just sit facing
+        # toward their object.
+        tama_center_x = (
+            self.x()
+            + (self.width() // 2)
+        )
+
+        if self.interaction_target_x < tama_center_x:
+            self.facing_direction = "left"
+
+            self.set_sprite(
+                self.sit_left_sprite
+            )
+
+            self.place_on_ground(
+                self.sit_left_sprite
+            )
+
+        else:
+            self.facing_direction = "right"
+
+            self.set_sprite(
+                self.sit_right_sprite
+            )
+
+            self.place_on_ground(
+                self.sit_right_sprite
+            )
+
+
+    # -----------------------------------------------------
+    # EATING
+    # -----------------------------------------------------
+
+    def start_eating(self):
+        self.walk_timer.stop()
+        self.idle_timer.stop()
+
+        self.is_eating = True
+
+        # The eating sprites replace the visible bowl, but
+        # the interaction stays locked until the animation ends.
+        if self.interaction_ui is not None:
+            self.interaction_ui.clear_active_object()
+
+        self.eat_frame_index = 0
+        self.eat_frames_shown = 1
+
+        # Choose the eating sprites and offsets
+        # based on which way Tama is facing.
+        if self.facing_direction == "left":
+            self.eating_frames = (
+                self.eating_left_frames
+            )
+
+            x_offset = (
+                self.eating_left_x_offset
+            )
+
+            y_offset = (
+                self.eating_left_y_offset
+            )
+
+        else:
+            self.eating_frames = (
+                self.eating_right_frames
+            )
+
+            x_offset = (
+                self.eating_right_x_offset
+            )
+
+            y_offset = (
+                self.eating_right_y_offset
+            )
+
+        frame = self.eating_frames[
+            self.eat_frame_index
+        ]
+
+        self.set_sprite(frame)
+
+        # First put the eating sprite on the normal ground.
+        self.place_on_ground(frame)
+
+        # THEN apply the eating-specific adjustment,
+        # otherwise place_on_ground() overwrites Y.
+        self.move(
+            self.x() + x_offset,
+            self.y() + y_offset
+        )
+
+        self.eating_timer.start(500)
+
+    def animate_eating(self):
+        # 01 -> 02 repeated three times
+        # = six frames total.
+        if self.eat_frames_shown >= 6:
+            self.finish_eating()
+            return
+
+        if self.eat_frame_index == 0:
+            self.eat_frame_index = 1
+        else:
+            self.eat_frame_index = 0
+
+        frame = self.eating_frames[
+            self.eat_frame_index
+        ]
+
+        # Remember Tama's current position so changing
+        # eating frames cannot reset the eating offsets.
+        current_x = self.x()
+        current_y = self.y()
+
+        self.set_sprite(frame)
+
+        self.move(
+            current_x,
+            current_y
+        )
+
+        # Hold the resting/head-down frame a little longer,
+        # then make the NOM frame quicker.
+        if self.eat_frame_index == 0:
+            self.eating_timer.setInterval(500)
+        else:
+            self.eating_timer.setInterval(300)
+
+        self.eat_frames_shown += 1
+
+    def finish_eating(self):
+        self.eating_timer.stop()
+
+        self.is_eating = False
+
+        self.interaction_target = None
+        self.interaction_target_x = None
+        self.interaction_ui = None
+
+        # Happy normal Tama again.
+        if self.facing_direction == "left":
+            self.sit_left()
+        else:
+            self.sit_right()
+
+    # -----------------------------------------------------
     # WALKING
     # -----------------------------------------------------
 
@@ -1400,8 +1903,8 @@ class Tama(QLabel):
         self.walk_frame_direction = 1
 
         distance = random.randint(
-            80,
-            400
+            100,
+            800
         )
 
         if (
@@ -1425,24 +1928,21 @@ class Tama(QLabel):
 
             return
 
-        screen = QApplication.screenAt(
-            self.pos()
+        desktop_left, desktop_right = (
+            get_taskbar_horizontal_bounds(
+                self.x() + (self.width() // 2)
+            )
         )
-
-        if screen is None:
-            screen = QApplication.primaryScreen()
-
-        desktop = screen.availableGeometry()
 
         if direction == "left":
             self.walk_target_x = max(
-                desktop.left(),
+                desktop_left,
                 self.x() - distance
             )
 
         else:
             right_edge = (
-                desktop.right()
+                desktop_right
                 - self.width()
                 + 1
             )
@@ -1459,6 +1959,10 @@ class Tama(QLabel):
     def stop_walking(self):
         self.walk_timer.stop()
         self.walk_target_x = None
+
+        if self.interaction_target is not None:
+            self.finish_interaction_walk()
+            return
 
         if self.walk_direction == "left":
             self.sit_left()
@@ -1627,14 +2131,11 @@ class Tama(QLabel):
         # TASKBAR WALKING
         # ---------------------------------------------
 
-        screen = QApplication.screenAt(
-            self.pos()
+        desktop_left, desktop_right = (
+            get_taskbar_horizontal_bounds(
+                self.x() + (self.width() // 2)
+            )
         )
-
-        if screen is None:
-            screen = QApplication.primaryScreen()
-
-        desktop = screen.availableGeometry()
 
         if self.walk_direction == "left":
             new_x = (
@@ -1655,10 +2156,10 @@ class Tama(QLabel):
 
             if (
                 new_x
-                <= desktop.left()
+                <= desktop_left
             ):
                 self.move(
-                    desktop.left(),
+                    desktop_left,
                     self.y()
                 )
 
@@ -1671,7 +2172,7 @@ class Tama(QLabel):
             )
 
             right_edge = (
-                desktop.right()
+                desktop_right
                 - self.width()
                 + 1
             )
@@ -1714,28 +2215,110 @@ def main():
         lambda *_: app.quit()
     )
 
+    state = load_state()
+
+    # -------------------------------------------------
+    # TAMA
+    # -------------------------------------------------
+
     tama = Tama()
     tama.show()
 
-    close_button = CloseButton()
-
-    screen = QApplication.primaryScreen().availableGeometry()
-
-    close_button.move(
-        screen.right()
-        - close_button.width()
-        - 20,
-        screen.top() + 20
+    saved_tama = state.get(
+        "tama",
+        {}
     )
 
-    close_button.show()
+    tama_x = saved_tama.get("x")
+    tama_y = saved_tama.get("y")
 
-    tama_ui = TamaUI(resource_path("assets"), tama_window=tama)
-    tama_ui.move(
-        screen.left() + 20,
-        screen.top() + 20
+    if (
+        isinstance(tama_x, int)
+        and isinstance(tama_y, int)
+        and position_is_on_screen(
+            tama_x,
+            tama_y
+        )
+    ):
+        tama.move(
+            tama_x,
+            tama_y
+        )
+
+        # Tama remembers where she was,
+        # but does not assume the old platform
+        # still exists.
+        #
+        # Gravity will immediately find whatever
+        # is underneath her now.
+        tama.clear_current_surface()
+
+        tama.set_sprite(
+            tama.get_falling_sprite()
+        )
+
+        tama.is_falling = True
+
+    else:
+        QTimer.singleShot(
+            0,
+            tama.start_on_taskbar
+        )
+
+    # -------------------------------------------------
+    # TAMAGOTCHI UI
+    # -------------------------------------------------
+
+    tama_ui = TamaUI(
+        resource_path("assets"),
+        tama_window=tama
     )
+
+    saved_ui = state.get(
+        "ui",
+        {}
+    )
+
+    ui_x = saved_ui.get("x")
+    ui_y = saved_ui.get("y")
+
+    if (
+        isinstance(ui_x, int)
+        and isinstance(ui_y, int)
+        and position_is_on_screen(
+            ui_x,
+            ui_y
+        )
+    ):
+        tama_ui.move(
+            ui_x,
+            ui_y
+        )
+
+    else:
+        screen = (
+            QApplication
+            .primaryScreen()
+            .availableGeometry()
+        )
+
+        tama_ui.move(
+            screen.left() + 20,
+            screen.top() + 20
+        )
+
     tama_ui.show()
+
+    # -------------------------------------------------
+    # SAVE MEMORY WHEN TAMA CLOSES
+    # -------------------------------------------------
+
+    app.aboutToQuit.connect(
+        lambda: save_state(
+            tama,
+            tama_ui
+        )
+    )
 
     return app.exec()
 

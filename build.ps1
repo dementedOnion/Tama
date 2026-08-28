@@ -11,8 +11,12 @@ if (-not (Test-Path -LiteralPath $python -PathType Leaf)) {
 }
 
 Push-Location $projectRoot
+$originalPath = $env:PATH
 
 try {
+    # Keep unrelated development-tool DLLs out of PyInstaller's dependency scan.
+    $env:PATH = "$env:SystemRoot\System32;$env:SystemRoot"
+
     if (Test-Path -LiteralPath $buildDirectory) {
         Remove-Item -LiteralPath $buildDirectory -Recurse -Force
     }
@@ -35,5 +39,6 @@ try {
     Write-Host "Built dist\Tama.exe ($sizeMb MB)"
 }
 finally {
+    $env:PATH = $originalPath
     Pop-Location
 }
