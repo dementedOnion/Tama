@@ -27,6 +27,13 @@ WINDOW_PLATFORM_EDGE_GRACE = 16
 WINDOW_PLATFORM_EDGE_PROBE_STEP = 4
 SCREEN_EDGE_VISIBLE_INSET = 2
 BONK_LANDING_RECOVERY_MS = 500
+BED_SIT_TO_SLEEP_MS = 700
+TURN_FRAME_MS = 95
+TURN_PIVOT_STEP_PIXELS = 90
+TURN_FRAME_PATHS = {
+    ("left", "right"): (0, 2, 3, 4, 6),
+    ("right", "left"): (6, 4, 3, 2, 0),
+}
 
 
 class MONITORINFOEXW(ctypes.Structure):
@@ -429,6 +436,25 @@ class Tama(QLabel):
         self.walk_target_x = None
 
         # -------------------------------------------------
+        # TURNING
+        # -------------------------------------------------
+
+        self.turn_frames = [
+            self.load_sprite(
+                f"assets/sprites/turn/cat_turn_{i:02}.png"
+            )
+            for i in range(1, 8)
+        ]
+        self.is_turning = False
+        self.turn_sequence = []
+        self.turn_frame_index = 0
+        self.turn_target_direction = None
+        self.turn_finished_callback = None
+        self.turn_continue_condition = None
+        self.turn_pivot_step = False
+        self.turn_pivot_applied = 0
+
+        # -------------------------------------------------
         # EATING
         # -------------------------------------------------
 
@@ -480,6 +506,10 @@ class Tama(QLabel):
         self.interaction_target = None
         self.interaction_target_x = None
         self.interaction_ui = None
+        self.interaction_has_arrived = False
+        self.interaction_final_facing = None
+        self.interaction_arrival_settled = False
+        self.food_arrival_side = None
 
         # -------------------------------------------------
         # WINDOW SETUP
@@ -525,6 +555,9 @@ class Tama(QLabel):
         self.walk_timer = QTimer(self)
         self.walk_timer.timeout.connect(self.animate_walk)
 
+        self.turn_timer = QTimer(self)
+        self.turn_timer.timeout.connect(self.animate_turn)
+
         self.idle_timer = QTimer(self)
         self.idle_timer.setSingleShot(True)
         self.idle_timer.timeout.connect(self.choose_next_action)
@@ -547,6 +580,12 @@ class Tama(QLabel):
         self.sleep_end_timer = QTimer(self)
         self.sleep_end_timer.setSingleShot(True)
         self.sleep_end_timer.timeout.connect(self.begin_wake)
+
+        self.bed_sleep_pose_timer = QTimer(self)
+        self.bed_sleep_pose_timer.setSingleShot(True)
+        self.bed_sleep_pose_timer.timeout.connect(
+            self.enter_bed_sleep_position
+        )
 
         # Check whether Tama's current window-platform
         # has moved, vanished, minimized, etc.
@@ -676,7 +715,13 @@ class Tama(QLabel):
 
         return QPoint(x, position.y())
 
-    def _move_during_walk(self, x, y):
+    def _move_during_walk(
+        self,
+        x,
+        y,
+        direction=None,
+        stop_on_reject=True,
+    ):
         """Move one autonomous step without bouncing across a DPI edge.
 
         Walking frames have slightly different widths. Letting the normal
@@ -692,9 +737,10 @@ class Tama(QLabel):
         continues after the handoff.
         """
         position = QPoint(int(x), int(y))
+        movement_direction = direction or self.walk_direction
         intended_edge_x = (
             position.x() + SCREEN_EDGE_VISIBLE_INSET
-            if self.walk_direction == "left"
+            if movement_direction == "left"
             else position.x() + self.width() - 1 - SCREEN_EDGE_VISIBLE_INSET
         )
         intended_edge = QPoint(
@@ -708,7 +754,8 @@ class Tama(QLabel):
                 requested=position,
                 target_screen=None,
             )
-            self.stop_walking()
+            if stop_on_reject:
+                self.stop_walking()
             return False
 
         native_screen = self._native_screen
@@ -721,21 +768,21 @@ class Tama(QLabel):
         target_screen = None
 
         if (
-            self.walk_direction == "right"
+            movement_direction == "right"
             and position.x() + self.width() - 1 > geometry.right()
         ):
             target_screen = self._directional_neighbor_screen(
                 native_screen,
-                "right",
+                movement_direction,
                 position.y() + (self.height() // 2),
             )
         elif (
-            self.walk_direction == "left"
+            movement_direction == "left"
             and position.x() < geometry.left()
         ):
             target_screen = self._directional_neighbor_screen(
                 native_screen,
-                "left",
+                movement_direction,
                 position.y() + (self.height() // 2),
             )
 
@@ -1887,6 +1934,7 @@ class Tama(QLabel):
 
             self.pose_timer.stop()
             self.walk_timer.stop()
+            self.cancel_turn()
             self.idle_timer.stop()
 
             self.crouch_start_timer.stop()
@@ -1895,6 +1943,7 @@ class Tama(QLabel):
 
             self.sleep_timer.stop()
             self.sleep_end_timer.stop()
+            self.bed_sleep_pose_timer.stop()
 
             self.walk_target_x = None
 
@@ -2106,13 +2155,41 @@ class Tama(QLabel):
         self.is_post_land_recovery = False
 
         if self.interaction_target is not None:
+            # A completed Bed interaction belongs to the position where Tama
+            # sat.  Picking her up or otherwise falling moves her away from
+            # that completed arrival, even though the same Bed remains active.
+            # Clear only the Bed arrival latch here so landing recovery can
+            # route back to it instead of returning behind the settled guard
+            # and leaving the landing/crouch frame visible.
+            if (
+                self.interaction_target == "bed"
+                and self.interaction_has_arrived
+                and self.interaction_arrival_settled
+            ):
+                self.interaction_has_arrived = False
+                self.interaction_final_facing = None
+                self.interaction_arrival_settled = False
+
             # Food and bed live on the taskbar.  A window encountered on the
             # way down is only an intermediate landing, not arrival.
             if not self._interaction_surface_ready():
-                self.start_interaction_departure()
+                self.start_interaction_departure(resume_immediately=True)
                 return
 
-            self.start_interaction_walk()
+            if self._landed_on_interaction_target():
+                if self.interaction_target == "bed":
+                    bed_centered_x = (
+                        self.interaction_target_x - (self.width() // 2)
+                    )
+                    if self.x() != bed_centered_x:
+                        self.start_interaction_walk(
+                            resume_immediately=True
+                        )
+                        return
+                self.finish_interaction_arrival(from_landing=True)
+                return
+
+            self.start_interaction_walk(resume_immediately=True)
             return
 
         if (
@@ -2202,6 +2279,7 @@ class Tama(QLabel):
         if (
             self.is_carrying
             or self.is_falling
+            or self.is_turning
             or self.is_sleeping
             or self.is_waking
             or self.interaction_target is not None
@@ -2236,6 +2314,7 @@ class Tama(QLabel):
         if (
             self.is_carrying
             or self.is_falling
+            or self.is_turning
             or self.interaction_target is not None
         ):
             return
@@ -2321,6 +2400,7 @@ class Tama(QLabel):
             or self.is_sleeping
             or self.is_waking
             or self.is_eating
+            or self.is_turning
             or self.interaction_target is not None
             or self.walk_timer.isActive()
         ):
@@ -2378,6 +2458,7 @@ class Tama(QLabel):
         if (
             self.is_carrying
             or self.is_falling
+            or self.is_turning
             or self.walk_timer.isActive()
         ):
             self.crouch_timer.stop()
@@ -2409,6 +2490,7 @@ class Tama(QLabel):
         if (
             self.is_carrying
             or self.is_falling
+            or self.is_turning
             or self.walk_timer.isActive()
             or self.interaction_target is not None
         ):
@@ -2420,6 +2502,31 @@ class Tama(QLabel):
     # SLEEP
     # -----------------------------------------------------
 
+    def enter_bed_sleep_position(self):
+        """Start Bed's direction-matched sleep state after the sit preview."""
+        if (
+            self.interaction_target != "bed"
+            or not self.interaction_arrival_settled
+            or self.is_carrying
+            or self.is_falling
+            or self.is_turning
+        ):
+            return
+
+        self.start_sleep(self.facing_direction)
+
+    def _show_bed_sit_and_schedule_sleep(self, direction):
+        """Show Bed's approved sit transition before the next sleep cycle."""
+        self.facing_direction = direction
+        sprite = (
+            self.sit_left_sprite
+            if direction == "left"
+            else self.sit_right_sprite
+        )
+        self.set_sprite(sprite)
+        self.place_on_ground(sprite)
+        self.bed_sleep_pose_timer.start(BED_SIT_TO_SLEEP_MS)
+
     def start_sleep(
         self,
         direction
@@ -2427,10 +2534,12 @@ class Tama(QLabel):
         if (
             self.is_carrying
             or self.is_falling
+            or self.is_turning
         ):
             return
 
         self.idle_timer.stop()
+        self.bed_sleep_pose_timer.stop()
 
         self.is_sleeping = True
         self.is_waking = False
@@ -2553,6 +2662,7 @@ class Tama(QLabel):
 
         self.sleep_timer.stop()
         self.sleep_end_timer.stop()
+        self.bed_sleep_pose_timer.stop()
 
         self.is_sleeping = False
         self.is_waking = True
@@ -2595,7 +2705,40 @@ class Tama(QLabel):
 
         self.is_waking = False
 
+        if (
+            self.interaction_target == "bed"
+            and self.interaction_arrival_settled
+        ):
+            self.finish_bed_sleep()
+            return
+
         if self.sleep_direction == "left":
+            self.sit_left()
+        else:
+            self.sit_right()
+
+    def finish_bed_sleep(self):
+        """Despawn Bed and return a completed sleeper to normal decisions."""
+        if self.interaction_target != "bed":
+            return
+
+        direction = self.sleep_direction
+        self.bed_sleep_pose_timer.stop()
+
+        if self.interaction_ui is not None:
+            self.interaction_ui.clear_active_object()
+
+        self.interaction_target = None
+        self.interaction_target_x = None
+        self.interaction_ui = None
+        self.interaction_has_arrived = False
+        self.interaction_final_facing = None
+        self.interaction_arrival_settled = False
+        self.food_arrival_side = None
+
+        # Use the ordinary post-wake sit path now that the interaction lock is
+        # gone; it owns scheduling Tama's next autonomous decision.
+        if direction == "left":
             self.sit_left()
         else:
             self.sit_right()
@@ -2622,9 +2765,14 @@ class Tama(QLabel):
     def seek_interaction(self, interaction_type, target_x, interaction_ui=None):
         """Stop normal idle behaviour and go to a spawned object."""
 
+        self.cancel_turn()
         self.interaction_target = interaction_type
         self.interaction_target_x = target_x
         self.interaction_ui = interaction_ui
+        self.interaction_has_arrived = False
+        self.interaction_final_facing = None
+        self.interaction_arrival_settled = False
+        self.food_arrival_side = None
 
         # Stop Tama choosing unrelated activities.
         self.idle_timer.stop()
@@ -2634,6 +2782,7 @@ class Tama(QLabel):
 
         self.sleep_timer.stop()
         self.sleep_end_timer.stop()
+        self.bed_sleep_pose_timer.stop()
 
         self.is_sleeping = False
         self.is_waking = False
@@ -2650,7 +2799,7 @@ class Tama(QLabel):
 
         self.start_interaction_walk()
 
-    def start_interaction_departure(self):
+    def start_interaction_departure(self, resume_immediately=False):
         """Walk off whichever edge of the current platform is closest."""
         if (
             self.interaction_target is None
@@ -2676,9 +2825,40 @@ class Tama(QLabel):
         else:
             direction = "right"
 
+        if direction != self.facing_direction:
+            self._start_interaction_turn(
+                direction,
+                lambda: self._resume_interaction_departure(
+                    direction,
+                    resume_immediately=True,
+                ),
+            )
+            return
+
+        self._resume_interaction_departure(
+            direction,
+            resume_immediately=resume_immediately,
+        )
+
+    def _resume_interaction_departure(
+        self,
+        direction,
+        resume_immediately=False,
+    ):
+        """Resume the already-selected platform-edge route."""
+        if (
+            self.interaction_target is None
+            or self.is_falling
+            or self.is_post_land_recovery
+            or self.current_surface_y is None
+        ):
+            return
+
         self.start_walk(direction)
         self.walk_direction = direction
         Tama._update_interaction_departure_target(self)
+        if resume_immediately:
+            self.animate_walk()
 
     def _update_interaction_departure_target(self):
         """Keep an interaction drop point attached to its moving platform."""
@@ -2695,8 +2875,15 @@ class Tama(QLabel):
                 + 10
             )
 
-    def start_interaction_walk(self):
+    def start_interaction_walk(self, resume_immediately=False):
         if self.interaction_target is None or self.is_post_land_recovery:
+            return
+
+        # Once arrival has been confirmed, the object's X coordinate is no
+        # longer a navigation target.  In particular, a pivot step must not
+        # make the continuation choose the opposite direction again.
+        if self.interaction_has_arrived:
+            self.finish_interaction_arrival()
             return
 
         if self.interaction_target_x is None:
@@ -2709,33 +2896,111 @@ class Tama(QLabel):
                 self.fall_from_platform()
             return
 
-        # Aim Tama's centre roughly at the object's centre.
-        target_x = (
-            self.interaction_target_x
-            - (self.width() // 2)
-        )
-
         if self.interaction_target == "food":
-            food_stop_offset = 95
-
-            if target_x < self.x():
-                target_x += food_stop_offset
-            else:
-                target_x -= food_stop_offset
-
-        self.walk_target_x = target_x
+            side = (
+                "right"
+                if self.interaction_target_x < self.x() + (self.width() // 2)
+                else "left"
+            )
+            target_x = self._food_eating_anchor_x(side)
+        else:
+            # Aim Tama's centre roughly at the object's centre.
+            target_x = (
+                self.interaction_target_x
+                - (self.width() // 2)
+            )
 
         if target_x < self.x():
-            self.walk_direction = "left"
-            self.facing_direction = "left"
+            direction = "left"
         else:
-            self.walk_direction = "right"
-            self.facing_direction = "right"
+            direction = "right"
+
+        if direction != self.facing_direction:
+            self._start_interaction_turn(
+                direction,
+                lambda: self._resume_interaction_walk(
+                    direction,
+                    target_x,
+                    resume_immediately=True,
+                ),
+            )
+            return
+
+        self._resume_interaction_walk(
+            direction,
+            target_x,
+            resume_immediately=resume_immediately,
+        )
+
+    def _resume_interaction_walk(
+        self,
+        direction,
+        target_x,
+        resume_immediately=False,
+    ):
+        """Resume a previously selected object route, including its timer."""
+        if (
+            self.interaction_target is None
+            or self.is_falling
+            or self.is_post_land_recovery
+            or not self._interaction_surface_ready()
+        ):
+            return
+
+        self.walk_target_x = target_x
+        self.walk_direction = direction
+        self.facing_direction = direction
 
         self.walk_frame_index = 0
         self.walk_frame_direction = 1
 
         self.walk_timer.start(140)
+        if resume_immediately:
+            self.animate_walk()
+
+    def _food_eating_anchor_x(self, side):
+        """Return Tama's existing Food-relative stop position for one side."""
+        bowl_centered_x = self.interaction_target_x - (self.width() // 2)
+        food_stop_offset = 95
+        if side == "left":
+            return bowl_centered_x - food_stop_offset
+        return bowl_centered_x + food_stop_offset
+
+    def _start_landed_food_reposition(self):
+        """Move Tama from a Food landing to her chosen eating anchor."""
+        target_x = self._food_eating_anchor_x(self.food_arrival_side)
+        if target_x == self.x():
+            self.finish_interaction_arrival()
+            return
+
+        direction = "left" if target_x < self.x() else "right"
+        # Landing-on-Food deliberately uses an instant walking orientation.
+        # The reusable animated turn is not part of this short reposition.
+        self._resume_interaction_walk(
+            direction,
+            target_x,
+            resume_immediately=True,
+        )
+
+    def _start_interaction_turn(self, direction, on_complete):
+        """Turn toward the current object while guarding its continuation."""
+        expected_target = self.interaction_target
+        expected_x = self.interaction_target_x
+        expected_ui = self.interaction_ui
+
+        def target_is_current():
+            return (
+                self.interaction_target == expected_target
+                and self.interaction_target_x == expected_x
+                and self.interaction_ui is expected_ui
+            )
+
+        self.start_turn(
+            direction,
+            on_complete=on_complete,
+            can_continue=target_is_current,
+            pivot_step=True,
+        )
 
     def finish_interaction_walk(self):
         self.walk_timer.stop()
@@ -2746,49 +3011,68 @@ class Tama(QLabel):
                 self.fall_from_platform()
             return
 
+        self.finish_interaction_arrival()
+
+    def _landed_on_interaction_target(self):
+        """Return whether a taskbar landing already overlaps the object."""
+        if (
+            not self._interaction_surface_ready()
+            or self.interaction_target_x is None
+        ):
+            return False
+
+        return self.x() <= self.interaction_target_x <= self.x() + self.width()
+
+    def finish_interaction_arrival(self, from_landing=False):
+        """Commit arrival and enter the object's existing interaction."""
+        if self.interaction_target is None:
+            return
+
+        # Arrival is committed before any pose/facing work.  Route updates can
+        # no longer compare the target X and reverse after a landing or pivot.
+        self.interaction_has_arrived = True
+        self.walk_timer.stop()
+        self.walk_target_x = None
+
+        if self.interaction_target == "food" and from_landing:
+            if self.food_arrival_side is None:
+                self.food_arrival_side = random.choice(("left", "right"))
+            self._start_landed_food_reposition()
+            return
+
+        if self.interaction_arrival_settled:
+            return
+
+        self.interaction_arrival_settled = True
+
+        if self.interaction_target == "bed":
+            # Bed is centred beneath Tama, so deriving a side from the final
+            # X position is ambiguous and can flip with walk-frame widths.
+            # Preserve the direction she used to approach the Bed instead.
+            direction = self.facing_direction
+        elif self.interaction_target == "food" and self.food_arrival_side:
+            # Final Food orientation is intentionally instantaneous: Tama
+            # faces inward from the stored eating side, then eats at once.
+            direction = (
+                "right" if self.food_arrival_side == "left" else "left"
+            )
+        else:
+            tama_center_x = self.x() + (self.width() // 2)
+            direction = (
+                "left"
+                if self.interaction_target_x < tama_center_x
+                else "right"
+            )
+        self.interaction_final_facing = direction
+        self.facing_direction = direction
+
         # Food begins its eating animation immediately.
         if self.interaction_target == "food":
-            tama_center_x = (
-                self.x()
-                + (self.width() // 2)
-            )
-
-            if self.interaction_target_x < tama_center_x:
-                self.facing_direction = "left"
-            else:
-                self.facing_direction = "right"
-
             self.start_eating()
             return
 
-        # Other interactions currently just sit facing
-        # toward their object.
-        tama_center_x = (
-            self.x()
-            + (self.width() // 2)
-        )
-
-        if self.interaction_target_x < tama_center_x:
-            self.facing_direction = "left"
-
-            self.set_sprite(
-                self.sit_left_sprite
-            )
-
-            self.place_on_ground(
-                self.sit_left_sprite
-            )
-
-        else:
-            self.facing_direction = "right"
-
-            self.set_sprite(
-                self.sit_right_sprite
-            )
-
-            self.place_on_ground(
-                self.sit_right_sprite
-            )
+        if self.interaction_target == "bed":
+            self._show_bed_sit_and_schedule_sleep(direction)
 
 
     # -----------------------------------------------------
@@ -2905,6 +3189,10 @@ class Tama(QLabel):
         self.interaction_target = None
         self.interaction_target_x = None
         self.interaction_ui = None
+        self.interaction_has_arrived = False
+        self.interaction_final_facing = None
+        self.interaction_arrival_settled = False
+        self.food_arrival_side = None
 
         # Happy normal Tama again.
         if self.facing_direction == "left":
@@ -2913,13 +3201,177 @@ class Tama(QLabel):
             self.sit_right()
 
     # -----------------------------------------------------
-    # WALKING
+    # TURNING / WALKING
     # -----------------------------------------------------
 
     def start_walk(
         self,
         direction
     ):
+        if (
+            self.is_carrying
+            or self.is_falling
+            or self.is_sleeping
+            or self.is_waking
+            or self.is_post_land_recovery
+            or self.is_turning
+        ):
+            return
+
+        if (
+            self.interaction_target is None
+            and direction != self.facing_direction
+        ):
+            self.start_turn(
+                direction,
+                on_complete=lambda: self._begin_walk(
+                    direction,
+                    after_turn=True,
+                ),
+                pivot_step=True,
+            )
+            return
+
+        self._begin_walk(direction)
+
+    def start_turn(
+        self,
+        direction,
+        on_complete=None,
+        can_continue=None,
+        pivot_step=False,
+    ):
+        path = TURN_FRAME_PATHS.get(
+            (self.facing_direction, direction)
+        )
+        if (
+            path is None
+            or self.is_turning
+            or self.is_carrying
+            or self.is_falling
+            or self.is_sleeping
+            or self.is_waking
+            or self.is_post_land_recovery
+            or (
+                self.interaction_target is not None
+                and can_continue is None
+            )
+            or (
+                can_continue is not None
+                and not can_continue()
+            )
+        ):
+            return
+
+        self.idle_timer.stop()
+        self.crouch_start_timer.stop()
+        self.crouch_timer.stop()
+        self.crouch_end_timer.stop()
+        self.walk_timer.stop()
+        self.walk_target_x = None
+
+        self.is_turning = True
+        self.turn_target_direction = direction
+        self.turn_finished_callback = on_complete
+        self.turn_continue_condition = can_continue
+        self.turn_pivot_step = pivot_step
+        self.turn_pivot_applied = 0
+        self.turn_sequence = [self.turn_frames[index] for index in path]
+        self.turn_frame_index = 0
+        self._show_turn_frame()
+        self.turn_timer.start(TURN_FRAME_MS)
+
+    def _show_turn_frame(self):
+        frame = self.turn_sequence[self.turn_frame_index]
+        self.set_sprite(frame)
+        self.place_on_ground(frame)
+        Tama._apply_turn_pivot_step(self)
+
+    def _apply_turn_pivot_step(self):
+        """Apply the optional late, cosmetic step without changing turn state."""
+        if not self.turn_pivot_step:
+            return
+
+        movement_start_frame = len(self.turn_sequence) - 3
+        if self.turn_frame_index < movement_start_frame:
+            return
+
+        if self.turn_frame_index == movement_start_frame:
+            desired_total = TURN_PIVOT_STEP_PIXELS // 6
+        elif self.turn_frame_index == movement_start_frame + 1:
+            desired_total = TURN_PIVOT_STEP_PIXELS // 2
+        else:
+            desired_total = TURN_PIVOT_STEP_PIXELS
+        step = desired_total - self.turn_pivot_applied
+        if step <= 0:
+            return
+
+        direction_sign = -1 if self.turn_target_direction == "left" else 1
+        new_x = self.x() + (direction_sign * step)
+
+        # A turn on a window must never step Tama off that platform. Reject
+        # only this cosmetic movement; the visual turn and continuation remain.
+        if self.current_surface_y is not None:
+            new_center_x = new_x + (self.width() // 2)
+            if (
+                self.current_surface_left is None
+                or self.current_surface_right is None
+                or new_center_x < self.current_surface_left
+                or new_center_x > self.current_surface_right
+            ):
+                return
+
+        moved = self._move_during_walk(
+            new_x,
+            self.y(),
+            direction=self.turn_target_direction,
+            stop_on_reject=False,
+        )
+        if moved:
+            self.turn_pivot_applied = desired_total
+
+    def animate_turn(self):
+        if (
+            not self.is_turning
+            or self.is_carrying
+            or self.is_falling
+            or self.is_post_land_recovery
+            or (
+                self.turn_continue_condition is not None
+                and not self.turn_continue_condition()
+            )
+            or (
+                self.interaction_target is not None
+                and self.turn_continue_condition is None
+            )
+        ):
+            self.cancel_turn()
+            return
+
+        self.turn_frame_index += 1
+        if self.turn_frame_index < len(self.turn_sequence):
+            self._show_turn_frame()
+            return
+
+        direction = self.turn_target_direction
+        on_complete = self.turn_finished_callback
+        self.cancel_turn()
+        self.facing_direction = direction
+        if on_complete is not None:
+            on_complete()
+
+    def cancel_turn(self):
+        self.turn_timer.stop()
+        self.is_turning = False
+        self.turn_sequence = []
+        self.turn_frame_index = 0
+        self.turn_target_direction = None
+        self.turn_finished_callback = None
+        self.turn_continue_condition = None
+        self.turn_pivot_step = False
+        self.turn_pivot_applied = 0
+
+    def _begin_walk(self, direction, after_turn=False):
         if (
             self.is_carrying
             or self.is_falling
@@ -2939,7 +3391,16 @@ class Tama(QLabel):
         self.walk_direction = direction
         self.facing_direction = direction
 
-        self.walk_frame_index = 0
+        frames = (
+            self.walk_left_frames
+            if direction == "left"
+            else self.walk_right_frames
+        )
+        self.walk_frame_index = (
+            1
+            if after_turn and len(frames) > 1
+            else 0
+        )
         self.walk_frame_direction = 1
 
         distance = random.randint(
@@ -2965,6 +3426,9 @@ class Tama(QLabel):
             self.walk_timer.start(
                 140
             )
+
+            if after_turn:
+                self.animate_walk()
 
             return
 
@@ -2996,6 +3460,9 @@ class Tama(QLabel):
             140
         )
 
+        if after_turn:
+            self.animate_walk()
+
     def stop_walking(self):
         self.walk_timer.stop()
         self.walk_target_x = None
@@ -3026,6 +3493,7 @@ class Tama(QLabel):
             self.bonk_drop_pending = True
         self.pose_timer.stop()
         self.walk_timer.stop()
+        self.cancel_turn()
         self.idle_timer.stop()
 
         self.crouch_start_timer.stop()
@@ -3034,6 +3502,7 @@ class Tama(QLabel):
 
         self.sleep_timer.stop()
         self.sleep_end_timer.stop()
+        self.bed_sleep_pose_timer.stop()
         self.is_sleeping = False
         self.is_waking = False
 

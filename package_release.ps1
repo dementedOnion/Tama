@@ -37,14 +37,15 @@ try {
     Copy-Item -LiteralPath $testerExecutable -Destination $packageRoot
     Copy-Item -LiteralPath $testerNotes -Destination $packageRoot
 
-    # Git supplies the allowlist, so ignored and untracked local files cannot
-    # enter the source snapshot. Missing paths are tracked deletions.
-    $trackedFiles = & $git -C $projectRoot ls-files
+    # Git supplies the allowlist, including intentional untracked source/assets
+    # from the current working tree while still excluding ignored build output
+    # and local environment files. Missing paths remain tracked deletions.
+    $sourceFiles = & $git -C $projectRoot ls-files --cached --others --exclude-standard
     if ($LASTEXITCODE -ne 0) {
-        throw "Git could not list the tracked project files."
+        throw "Git could not list the working-tree source files."
     }
 
-    foreach ($relativePath in $trackedFiles) {
+    foreach ($relativePath in $sourceFiles) {
         if ($relativePath -like "Testers/*") {
             continue
         }

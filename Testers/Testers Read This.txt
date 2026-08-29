@@ -8,39 +8,39 @@ She's still in development, so please poke at things, try to break things, and l
 
 - Pick Tama up and YEET her!
 Click and drag Tama to pick her up. Drop her somewhere and she'll fall and land on whatever she can find.
+(actual YEET physics coming VERY soon)
 
 - Put her on your windows.
-Tama can walk along the tops of open windows. Try moving, resizing, minimising, or closing windows while she's around.
-
-- Move her between monitors.
-If you have multiple monitors, yeet her onto another one and see what she gets up to.
+Tama can walk along the tops of open windows. Try moving, resizing, minimizing, or closing windows while she's around.
 
 - Let her wander.
-Tama walks, sits, sleeps and makes her own decisions. She may occasionally wander completely off-screen. She's fine. Probably.
+Tama walks, sits, sleeps and makes her own decisions. She may occasionally wander completely off-screen. She's fine.
+Probably.
+*Please let me know if she doesn't come back lol
 
 - Feed her.
-Open Tama's pink Tamagotchi UI, select the food icon and press the middle button. Tama will find the food, walk over and eat it.
-No touching while she's eating. The noms are serious business.
-
-- Try feeding her from another monitor.
-Move the Tamagotchi UI to another screen before spawning food. Tama should make her way over to it.
+On Tama's UI, select the food icon and press the middle button. Tama will find the food, walk over and eat it.
 
 - Spawn her bed.
-The bed is available through the UI too. Its full interaction is still being worked on, but please muck around with it anyway.
+The bed is also available through the UI. Selecting the bed should make Tama walk to it and have a nap.
 
-- Drag the Tamagotchi UI around.
-Objects spawn on the monitor where the UI currently is.
+- Move her between monitors.
+If you have multiple monitors, move the UI to another screen before spawning objects. Tama should make her way over to them.
+She should be set for all resolutions and scales.
 
-- Close the UI.
-The little X closes the Tamagotchi UI without closing Tama herself.
-Close and reopen Tama.
-Tama has a memory! Her saved state should persist between sessions. Let me know if anything seems to reset when it shouldn't.
+*Tama may disappear if she is currently on a monitor when it changes to a different scale or rez. Resetting Tama allows her to work on new scale.
+
+- Close and minimize the UI.
+The 'x' on the UI closes the Program, and the '_' minimizes the UI only, leaving Tama to continue what she's doing.
+
+Tama has a memory! Her saved state should persist between sessions(UI and Tama will be in their last positions, and not reset).
 
 🔨 Still being built -----------------
 
 Tama is very much a work in progress. More interactions, needs, animations, jumping/window parkour and other tiny-cat bullshit are coming.
 
-If something breaks, flickers, gets stuck, disappears forever, behaves differently across monitors, or just makes you say “what the fuck are you doing, Tama?” — please tell me what happened and, if possible, what you were doing just before it happened.
+If something breaks, or otherwise acts differently from the above mentioned, please let me know.
+In saying that, please TRY to break her to find bugs and glitches and remember what you were doing so I can replicate and fix it ^^
 
 🛡️ A note about Windows Security -----
 
@@ -52,6 +52,7 @@ She does not read the contents of your windows — she only needs information ab
 
 If Windows shows a “Windows protected your PC” message, you may need to click More info → Run anyway to start Tama.
 
-Most importantly: mess with her.
-Half of Tama's job is to be in your way.
-Grab the scruff. YEET THE CAT. 🐈‍⬛💨
+-----------------------------------------
+
+Thanks for helping me break Tama so I can make her better ^^
+If she gets in your way, congratulations! She's working as intended xD
