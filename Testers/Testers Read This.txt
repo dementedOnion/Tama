@@ -1,0 +1,57 @@
+🐾 Meet Tama! -----------------------
+
+Tama is a tiny desktop cat who lives on your taskbar, your windows, and occasionally wherever the hell she feels like going.
+
+She's still in development, so please poke at things, try to break things, and let me know if Tama does anything particularly weird!
+
+💀 Things to try --------------------
+
+- Pick Tama up and YEET her!
+Click and drag Tama to pick her up. Drop her somewhere and she'll fall and land on whatever she can find.
+
+- Put her on your windows.
+Tama can walk along the tops of open windows. Try moving, resizing, minimising, or closing windows while she's around.
+
+- Move her between monitors.
+If you have multiple monitors, yeet her onto another one and see what she gets up to.
+
+- Let her wander.
+Tama walks, sits, sleeps and makes her own decisions. She may occasionally wander completely off-screen. She's fine. Probably.
+
+- Feed her.
+Open Tama's pink Tamagotchi UI, select the food icon and press the middle button. Tama will find the food, walk over and eat it.
+No touching while she's eating. The noms are serious business.
+
+- Try feeding her from another monitor.
+Move the Tamagotchi UI to another screen before spawning food. Tama should make her way over to it.
+
+- Spawn her bed.
+The bed is available through the UI too. Its full interaction is still being worked on, but please muck around with it anyway.
+
+- Drag the Tamagotchi UI around.
+Objects spawn on the monitor where the UI currently is.
+
+- Close the UI.
+The little X closes the Tamagotchi UI without closing Tama herself.
+Close and reopen Tama.
+Tama has a memory! Her saved state should persist between sessions. Let me know if anything seems to reset when it shouldn't.
+
+🔨 Still being built -----------------
+
+Tama is very much a work in progress. More interactions, needs, animations, jumping/window parkour and other tiny-cat bullshit are coming.
+
+If something breaks, flickers, gets stuck, disappears forever, behaves differently across monitors, or just makes you say “what the fuck are you doing, Tama?” — please tell me what happened and, if possible, what you were doing just before it happened.
+
+🛡️ A note about Windows Security -----
+
+When you first run Tama, Windows may show a security warning because Tama is currently an unsigned, independently made application.
+
+Tama needs to read the positions and sizes of your taskbar and open windows so she knows where she can stand, walk, fall and land.
+
+She does not read the contents of your windows — she only needs information about their position/size and whether they're available for her to stand on.
+
+If Windows shows a “Windows protected your PC” message, you may need to click More info → Run anyway to start Tama.
+
+Most importantly: mess with her.
+Half of Tama's job is to be in your way.
+Grab the scruff. YEET THE CAT. 🐈‍⬛💨

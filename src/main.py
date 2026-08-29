@@ -4,15 +4,86 @@ import random
 import ctypes
 import json
 import os
+import math
+from datetime import datetime
 from pathlib import Path
 
 from ctypes import wintypes
 
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import QPoint, Qt, QTimer
 from PySide6.QtGui import QCursor, QPixmap
 from PySide6.QtWidgets import QApplication, QLabel, QPushButton
 
 from tama_ui import TamaUI
+
+
+DIAGNOSTIC_BUILD = "movement-screen-diagnostics-2026-08-29-1"
+
+# Logical pixels around Tama's horizontal landing point.  Alternate probes are
+# still required to be genuinely exposed by Win32, so this does not turn a
+# fully covered window into a platform.  Keeping this in Qt coordinates makes
+# the allowance consistent across monitor scaling factors.
+WINDOW_PLATFORM_EDGE_GRACE = 16
+WINDOW_PLATFORM_EDGE_PROBE_STEP = 4
+SCREEN_EDGE_VISIBLE_INSET = 2
+BONK_LANDING_RECOVERY_MS = 500
+
+
+class MONITORINFOEXW(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", wintypes.DWORD),
+        ("rcMonitor", wintypes.RECT),
+        ("rcWork", wintypes.RECT),
+        ("dwFlags", wintypes.DWORD),
+        ("szDevice", wintypes.WCHAR * 32),
+    ]
+
+
+def get_dpi_log_file():
+    appdata = os.environ.get("APPDATA")
+    base = Path(appdata) / "Tama" if appdata else Path.home() / ".tama"
+    base.mkdir(parents=True, exist_ok=True)
+    return base / "dpi-debug.log"
+
+
+def dpi_log(message):
+    """Append diagnostics even in the windowed packaged executable."""
+    try:
+        with get_dpi_log_file().open("a", encoding="utf-8") as file:
+            timestamp = datetime.now().astimezone().isoformat(timespec="milliseconds")
+            file.write(f"{timestamp} [{DIAGNOSTIC_BUILD}] {message}\n")
+    except OSError:
+        pass
+
+
+def windows_dpi_context():
+    if sys.platform != "win32":
+        return "non-Windows"
+
+    details = []
+    try:
+        user32 = ctypes.windll.user32
+        context = user32.GetThreadDpiAwarenessContext()
+        user32.GetAwarenessFromDpiAwarenessContext.restype = ctypes.c_int
+        awareness = user32.GetAwarenessFromDpiAwarenessContext(context)
+        details.append(f"thread_context={context:#x} awareness={awareness}")
+    except (AttributeError, OSError, ValueError) as error:
+        details.append(f"thread_context_error={error!r}")
+
+    try:
+        shcore = ctypes.windll.shcore
+        process_awareness = ctypes.c_int(-1)
+        result = shcore.GetProcessDpiAwareness(
+            ctypes.windll.kernel32.GetCurrentProcess(),
+            ctypes.byref(process_awareness),
+        )
+        details.append(
+            f"process_awareness={process_awareness.value} result={result}"
+        )
+    except (AttributeError, OSError, ValueError) as error:
+        details.append(f"process_awareness_error={error!r}")
+
+    return " ".join(details)
 
 
 def resource_path(relative_path):
@@ -229,6 +300,10 @@ class Tama(QLabel):
         self.is_falling = False
         self.is_sleeping = False
         self.is_waking = False
+        self.is_post_land_recovery = False
+        self.bonk_drop_pending = False
+        self.bonk_source_surface_hwnd = None
+        self.ignored_platform_hwnds = set()
 
         # Direction Tama is currently facing
         self.facing_direction = "left"
@@ -240,6 +315,7 @@ class Tama(QLabel):
         self.current_surface_y = None
         self.current_surface_left = None
         self.current_surface_right = None
+        self.live_exposure_failures = 0
 
         # -------------------------------------------------
         # IDLE SPRITES
@@ -419,6 +495,12 @@ class Tama(QLabel):
 
         self.setAttribute(Qt.WA_TranslucentBackground)
 
+        # The QWidget and all of Tama's animation/game state survive screen
+        # changes.  Only the native translucent window is replaced when its
+        # device-pixel ratio changes (see move()).
+        self._native_screen = None
+        self._last_dpi_diag_screen = None
+
         # -------------------------------------------------
         # TIMERS
         # -------------------------------------------------
@@ -492,6 +574,439 @@ class Tama(QLabel):
     # SPRITE HELPERS
     # -----------------------------------------------------
 
+    def move(self, *args):
+        """Move Tama and rebuild her native surface at a mixed-DPI boundary.
+
+        A Windows translucent top-level widget owns a native, DPR-sized
+        backing surface.  Reassigning the existing QWindow to another screen
+        does not reliably rebuild that surface, leaving Qt and Windows to
+        disagree about its physical size.  Keep the QLabel and its state, but
+        replace only its native window when Tama's centre crosses to a screen
+        with a different device-pixel ratio.
+        """
+        if len(args) == 1 and isinstance(args[0], QPoint):
+            position = args[0]
+        elif len(args) == 2:
+            position = QPoint(int(args[0]), int(args[1]))
+        else:
+            return super().move(*args)
+
+        center = QPoint(
+            position.x() + (self.width() // 2),
+            position.y() + (self.height() // 2),
+        )
+        target_screen = QApplication.screenAt(center)
+        window_handle = self.windowHandle()
+        current_screen = self._native_screen
+
+        if current_screen is None and window_handle is not None:
+            current_screen = window_handle.screen()
+
+        self._log_dpi_state(
+            "move-request",
+            requested=position,
+            target_screen=target_screen,
+        )
+
+        target_name = target_screen.name() if target_screen is not None else None
+        if target_name != self._last_dpi_diag_screen:
+            self._log_dpi_state(
+                "move-target-change",
+                requested=position,
+                target_screen=target_screen,
+            )
+            self._last_dpi_diag_screen = target_name
+
+        crosses_dpr_boundary = (
+            target_screen is not None
+            and current_screen is not None
+            and current_screen is not target_screen
+            and abs(
+                current_screen.devicePixelRatio()
+                - target_screen.devicePixelRatio()
+            ) > 0.01
+        )
+
+        if crosses_dpr_boundary:
+            handoff_position = self._contained_handoff_position(
+                position,
+                target_screen,
+            )
+            self._log_dpi_state(
+                "mixed-dpi-handoff-enter",
+                requested=handoff_position,
+                target_screen=target_screen,
+            )
+            self._recreate_native_window(handoff_position, target_screen)
+            return
+
+        super().move(position)
+
+        if (
+            target_screen is not None
+            and window_handle is not None
+            and window_handle.screen() is not target_screen
+        ):
+            window_handle.setScreen(target_screen)
+
+        if target_screen is not None:
+            self._native_screen = target_screen
+
+        self._log_dpi_state(
+            "move-complete",
+            requested=position,
+            target_screen=target_screen,
+        )
+
+    def _contained_handoff_position(self, position, target_screen):
+        """Return a position wholly on the destination side of a boundary.
+
+        The centre-based screen change occurs while roughly half the widget is
+        still on the old monitor.  A translucent native surface cannot safely
+        span monitors with different DPRs, so complete that small horizontal
+        step while the old HWND is hidden.
+        """
+        geometry = target_screen.geometry()
+        x = position.x()
+
+        if x < geometry.left():
+            x = geometry.left()
+        elif x + self.width() - 1 > geometry.right():
+            x = geometry.right() - self.width() + 1
+
+        return QPoint(x, position.y())
+
+    def _move_during_walk(self, x, y):
+        """Move one autonomous step without bouncing across a DPI edge.
+
+        Walking frames have slightly different widths. Letting the normal
+        centre-based move() choose a screen after every adjustSize() can make
+        those width changes repeatedly switch the candidate screen at a
+        mixed-DPI boundary. A mouse drag does not suffer from that ambiguity
+        because the cursor supplies a steadily advancing destination.
+
+        For an autonomous walk, use its direction instead: as soon as the
+        next window rectangle would straddle a different-DPR neighbour,
+        recreate the native window wholly on that neighbour. The global
+        walk_target_x is deliberately left untouched so the current walk
+        continues after the handoff.
+        """
+        position = QPoint(int(x), int(y))
+        intended_edge_x = (
+            position.x() + SCREEN_EDGE_VISIBLE_INSET
+            if self.walk_direction == "left"
+            else position.x() + self.width() - 1 - SCREEN_EDGE_VISIBLE_INSET
+        )
+        intended_edge = QPoint(
+            intended_edge_x,
+            position.y() + (self.height() // 2),
+        )
+
+        if QApplication.screenAt(intended_edge) is None:
+            self._log_dpi_state(
+                "walk-rejected-outside-screens",
+                requested=position,
+                target_screen=None,
+            )
+            self.stop_walking()
+            return False
+
+        native_screen = self._native_screen
+
+        if native_screen is None:
+            self.move(position)
+            return True
+
+        geometry = native_screen.geometry()
+        target_screen = None
+
+        if (
+            self.walk_direction == "right"
+            and position.x() + self.width() - 1 > geometry.right()
+        ):
+            target_screen = self._directional_neighbor_screen(
+                native_screen,
+                "right",
+                position.y() + (self.height() // 2),
+            )
+        elif (
+            self.walk_direction == "left"
+            and position.x() < geometry.left()
+        ):
+            target_screen = self._directional_neighbor_screen(
+                native_screen,
+                "left",
+                position.y() + (self.height() // 2),
+            )
+
+        crosses_dpr_boundary = (
+            target_screen is not None
+            and target_screen is not native_screen
+            and abs(
+                native_screen.devicePixelRatio()
+                - target_screen.devicePixelRatio()
+            ) > 0.01
+        )
+
+        if crosses_dpr_boundary:
+            handoff_position = self._contained_handoff_position(
+                position,
+                target_screen,
+            )
+            handoff_position = self._taskbar_handoff_position(
+                handoff_position,
+                target_screen,
+            )
+            self._log_dpi_state(
+                "mixed-dpi-directional-walk-handoff-enter",
+                requested=handoff_position,
+                target_screen=target_screen,
+            )
+            self._recreate_native_window(handoff_position, target_screen)
+            return True
+
+        self.move(position)
+        return True
+
+    def _would_cross_mixed_dpi_boundary(self, x, y):
+        """Return whether this walk step would straddle a mixed-DPI edge."""
+        native_screen = self._native_screen
+        if native_screen is None:
+            return False
+
+        geometry = native_screen.geometry()
+        target_screen = None
+        if self.walk_direction == "right" and x + self.width() - 1 > geometry.right():
+            target_screen = self._directional_neighbor_screen(
+                native_screen, "right", y + (self.height() // 2)
+            )
+        elif self.walk_direction == "left" and x < geometry.left():
+            target_screen = self._directional_neighbor_screen(
+                native_screen, "left", y + (self.height() // 2)
+            )
+
+        return (
+            target_screen is not None
+            and target_screen is not native_screen
+            and abs(
+                native_screen.devicePixelRatio()
+                - target_screen.devicePixelRatio()
+            ) > 0.01
+        )
+
+    def _directional_neighbor_screen(self, current_screen, direction, y):
+        """Find an adjacent screen using Qt logical coordinates only.
+
+        A one-pixel screenAt() probe is unreliable in mixed-DPI layouts: Qt's
+        logical monitor rectangles can contain a gap even when the native
+        monitor rectangles touch. Rank the screens on the requested side by
+        horizontal distance, then by distance from the walking height.
+        """
+        current = current_screen.geometry()
+        candidates = []
+
+        for screen in QApplication.screens():
+            if screen is current_screen:
+                continue
+
+            area = screen.geometry()
+            if direction == "right" and area.left() <= current.left():
+                continue
+            if direction == "left" and area.right() >= current.right():
+                continue
+
+            horizontal_gap = (
+                abs(area.left() - current.right())
+                if direction == "right"
+                else abs(current.left() - area.right())
+            )
+            vertical_gap = (
+                area.top() - y
+                if y < area.top()
+                else y - area.bottom()
+                if y > area.bottom()
+                else 0
+            )
+            candidates.append((horizontal_gap, vertical_gap, screen))
+
+        if not candidates:
+            return None
+
+        return min(candidates, key=lambda item: (item[0], item[1]))[2]
+
+    def _taskbar_handoff_position(self, position, target_screen):
+        """Anchor a taskbar walk to the destination taskbar during handoff."""
+        if self.current_surface_y is not None:
+            return position
+
+        sprite = self.pixmap()
+        if sprite is None:
+            return position
+
+        visible_bottom = self.find_visible_bottom(sprite)
+        return QPoint(
+            position.x(),
+            target_screen.availableGeometry().bottom() - visible_bottom,
+        )
+
+    def _recreate_native_window(self, position, target_screen):
+        """Recreate only the platform window on the destination screen."""
+        was_visible = self.isVisible()
+        old_hwnd = int(self.winId())
+
+        if was_visible:
+            self.hide()
+
+        # QWidget.destroy() frees the HWND/backing store without destroying
+        # this Python/Qt widget, its pixmap, timers, or animation state.
+        self.destroy(True, True)
+        super().move(position)
+
+        # winId() creates the replacement native window at the new logical
+        # geometry.  Explicitly bind it before showing so its translucent
+        # backing surface is allocated using the destination screen's DPR.
+        self.winId()
+        window_handle = self.windowHandle()
+
+        if (
+            window_handle is not None
+            and window_handle.screen() is not target_screen
+        ):
+            window_handle.setScreen(target_screen)
+
+        super().move(position)
+        self._native_screen = target_screen
+
+        self._log_dpi_state(
+            f"mixed-dpi-handoff-exit old_hwnd={old_hwnd:#x} "
+            f"new_hwnd={int(self.winId()):#x}",
+            requested=position,
+            target_screen=target_screen,
+        )
+
+        if was_visible:
+            self.show()
+            self.raise_()
+
+        self.update()
+
+    def _log_dpi_state(self, event, requested=None, target_screen=None):
+        """Record Qt and Win32's views of Tama's top-level surface."""
+        try:
+            hwnd = int(self.winId())
+            rect = wintypes.RECT()
+            client = wintypes.RECT()
+            ctypes.windll.user32.GetWindowRect(hwnd, ctypes.byref(rect))
+            ctypes.windll.user32.GetClientRect(hwnd, ctypes.byref(client))
+            try:
+                window_dpi = ctypes.windll.user32.GetDpiForWindow(hwnd)
+            except AttributeError:
+                window_dpi = None
+
+            handle = self.windowHandle()
+            actual_screen = handle.screen() if handle is not None else None
+            believed_screen = getattr(self, "_native_screen", None)
+            widget_center = QPoint(
+                self.x() + (self.width() // 2),
+                self.y() + (self.height() // 2),
+            )
+            detected_screen = QApplication.screenAt(widget_center)
+            pixmap = self.pixmap()
+            pixmap_text = "none"
+            if pixmap is not None:
+                pixmap_text = (
+                    f"{pixmap.width()}x{pixmap.height()}@{pixmap.devicePixelRatio():g}"
+                )
+
+            def screen_text(screen):
+                if screen is None:
+                    return "none"
+                geometry = screen.geometry()
+                available = screen.availableGeometry()
+                return (
+                    f"{screen.name()!r}:"
+                    f"{geometry.x()},{geometry.y()},"
+                    f"{geometry.width()}x{geometry.height()} "
+                    f"available={available.x()},{available.y()},"
+                    f"{available.width()}x{available.height()} "
+                    f"dpr={screen.devicePixelRatio():g}"
+                )
+
+            requested_text = (
+                f"{requested.x()},{requested.y()}" if requested is not None else "none"
+            )
+            requested_center = None
+            requested_screen = None
+            if requested is not None:
+                requested_center = QPoint(
+                    requested.x() + (self.width() // 2),
+                    requested.y() + (self.height() // 2),
+                )
+                requested_screen = QApplication.screenAt(requested_center)
+
+            requested_center_text = (
+                f"{requested_center.x()},{requested_center.y()}"
+                if requested_center is not None
+                else "none"
+            )
+
+            platform_text = "none"
+            platform_hwnd = getattr(self, "current_surface_hwnd", None)
+            if platform_hwnd is not None:
+                native_platform = self._native_platform_rect(platform_hwnd)
+                qt_platform = self._window_rect_in_qt_coordinates(platform_hwnd)
+                if native_platform is None:
+                    native_platform_text = "none"
+                else:
+                    native_platform_text = (
+                        f"{native_platform.left},{native_platform.top},"
+                        f"{native_platform.right},{native_platform.bottom}"
+                    )
+
+                if qt_platform is None:
+                    qt_platform_text = "none"
+                    mapping_text = "none"
+                else:
+                    left, top, right, bottom, mapping = qt_platform
+                    qt_platform_text = f"{left},{top},{right},{bottom}"
+                    native_monitor, logical_monitor = mapping
+                    mapping_text = (
+                        f"native={native_monitor.left},{native_monitor.top},"
+                        f"{native_monitor.right},{native_monitor.bottom} "
+                        f"logical={logical_monitor.x()},{logical_monitor.y()},"
+                        f"{logical_monitor.width()}x{logical_monitor.height()}"
+                    )
+
+                platform_text = (
+                    f"hwnd={int(platform_hwnd):#x} "
+                    f"native_rect={native_platform_text} "
+                    f"qt_rect={qt_platform_text} mapping=({mapping_text})"
+                )
+
+            dpi_log(
+                f"{event} requested={requested_text} "
+                f"requested_center={requested_center_text} "
+                f"requested_screen={screen_text(requested_screen)} "
+                f"qt_widget={self.x()},{self.y()},{self.width()}x{self.height()} "
+                f"qt_center={widget_center.x()},{widget_center.y()} "
+                f"hwnd={hwnd:#x} "
+                f"win_rect={rect.left},{rect.top},"
+                f"{rect.right - rect.left}x{rect.bottom - rect.top} "
+                f"win_center={(rect.left + rect.right) // 2},"
+                f"{(rect.top + rect.bottom) // 2} "
+                f"client={client.right - client.left}x{client.bottom - client.top} "
+                f"window_dpi={window_dpi} pixmap={pixmap_text} "
+                f"qwindow_dpr={handle.devicePixelRatio() if handle else None} "
+                f"screen_at_center={screen_text(detected_screen)} "
+                f"believed_screen={screen_text(believed_screen)} "
+                f"actual_screen={screen_text(actual_screen)} "
+                f"target_screen={screen_text(target_screen)} "
+                f"platform=({platform_text}) "
+                f"{windows_dpi_context()}"
+            )
+        except Exception as error:
+            dpi_log(f"{event} diagnostic_error={error!r}")
+
     def load_sprite(self, path):
         pixmap = QPixmap(str(resource_path(path)))
 
@@ -505,6 +1020,46 @@ class Tama(QLabel):
     def set_sprite(self, sprite):
         self.setPixmap(sprite)
         self.adjustSize()
+        self._contain_resized_surface_at_mixed_dpi_edge()
+
+    def _contain_resized_surface_at_mixed_dpi_edge(self):
+        """Keep a wider animation frame from re-straddling a DPI boundary."""
+        native_screen = getattr(self, "_native_screen", None)
+        if native_screen is None:
+            return
+
+        geometry = native_screen.geometry()
+        center_y = self.y() + (self.height() // 2)
+        x = self.x()
+
+        if x < geometry.left():
+            neighbor = QApplication.screenAt(
+                QPoint(geometry.left() - 1, center_y)
+            )
+            if (
+                neighbor is not None
+                and abs(
+                    neighbor.devicePixelRatio()
+                    - native_screen.devicePixelRatio()
+                ) > 0.01
+            ):
+                x = geometry.left()
+
+        elif x + self.width() - 1 > geometry.right():
+            neighbor = QApplication.screenAt(
+                QPoint(geometry.right() + 1, center_y)
+            )
+            if (
+                neighbor is not None
+                and abs(
+                    neighbor.devicePixelRatio()
+                    - native_screen.devicePixelRatio()
+                ) > 0.01
+            ):
+                x = geometry.right() - self.width() + 1
+
+        if x != self.x():
+            self.move(x, self.y())
 
     def get_carry_sprite(self):
         if self.facing_direction == "right":
@@ -589,6 +1144,7 @@ class Tama(QLabel):
         self.current_surface_y = None
         self.current_surface_left = None
         self.current_surface_right = None
+        self.live_exposure_failures = 0
 
     # -----------------------------------------------------
     # WINDOWS TOPMOST
@@ -620,6 +1176,228 @@ class Tama(QLabel):
     # WINDOWS PLATFORM FILTERING
     # -----------------------------------------------------
 
+    def _monitor_mapping_for_window(self, hwnd):
+        """Return the native monitor bounds and matching Qt screen.
+
+        Win32 window rectangles are physical pixels in this per-monitor-DPI
+        aware process. Tama movement is in Qt's device-independent global
+        coordinates, so platform geometry must cross this mapping exactly
+        once before it participates in collision detection.
+        """
+        if sys.platform != "win32":
+            return None
+
+        user32 = ctypes.windll.user32
+        MONITOR_DEFAULTTONEAREST = 2
+        user32.MonitorFromWindow.restype = wintypes.HMONITOR
+        monitor = user32.MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST)
+        if not monitor:
+            return None
+
+        info = MONITORINFOEXW()
+        info.cbSize = ctypes.sizeof(info)
+        if not user32.GetMonitorInfoW(monitor, ctypes.byref(info)):
+            return None
+
+        device_name = info.szDevice.removeprefix("\\\\.\\").upper()
+        screen = next(
+            (
+                candidate
+                for candidate in QApplication.screens()
+                if candidate.name().removeprefix("\\\\.\\").upper()
+                == device_name
+            ),
+            None,
+        )
+        if screen is None:
+            # QScreen.name() is a friendly monitor name on some Qt/driver
+            # combinations rather than the Win32 DISPLAY device identifier.
+            # Windows preserves monitor origins in Qt's global desktop space;
+            # use that stable geometry relationship as the fallback match.
+            screens = QApplication.screens()
+            if screens:
+                screen = min(
+                    screens,
+                    key=lambda candidate: (
+                        abs(candidate.geometry().left() - info.rcMonitor.left)
+                        + abs(candidate.geometry().top() - info.rcMonitor.top)
+                    ),
+                )
+            else:
+                return None
+
+        native = info.rcMonitor
+        logical = screen.geometry()
+        native_width = native.right - native.left
+        native_height = native.bottom - native.top
+        if native_width <= 0 or native_height <= 0:
+            return None
+
+        return native, logical
+
+    def _window_rect_in_qt_coordinates(self, hwnd):
+        """Get an HWND rectangle normalized to Tama's Qt coordinate space."""
+        rect = self._native_platform_rect(hwnd)
+        if rect is None:
+            return None
+
+        mapping = self._monitor_mapping_for_window(hwnd)
+        if mapping is None:
+            return None
+
+        native, logical = mapping
+        scale_x = logical.width() / (native.right - native.left)
+        scale_y = logical.height() / (native.bottom - native.top)
+
+        left = logical.left() + (rect.left - native.left) * scale_x
+        top = logical.top() + (rect.top - native.top) * scale_y
+        right = logical.left() + (rect.right - native.left) * scale_x
+        bottom = logical.top() + (rect.bottom - native.top) * scale_y
+
+        # Win32 RECT right/bottom are exclusive; Tama's stored surface bounds
+        # and Qt QRect edges are inclusive.
+        return (
+            math.floor(left),
+            math.floor(top),
+            math.ceil(right) - 1,
+            math.ceil(bottom) - 1,
+            mapping,
+        )
+
+    def _window_class_name(self, hwnd):
+        buffer = ctypes.create_unicode_buffer(256)
+        if not ctypes.windll.user32.GetClassNameW(hwnd, buffer, len(buffer)):
+            return ""
+        return buffer.value
+
+    def _window_title(self, hwnd):
+        length = ctypes.windll.user32.GetWindowTextLengthW(hwnd)
+        if length <= 0:
+            return ""
+        buffer = ctypes.create_unicode_buffer(length + 1)
+        ctypes.windll.user32.GetWindowTextW(hwnd, buffer, len(buffer))
+        return buffer.value
+
+    def _window_process_name(self, hwnd):
+        """Best-effort executable identity; class fallbacks cover elevation."""
+        process_id = wintypes.DWORD()
+        ctypes.windll.user32.GetWindowThreadProcessId(
+            hwnd,
+            ctypes.byref(process_id),
+        )
+        if not process_id.value:
+            return ""
+
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        ctypes.windll.kernel32.OpenProcess.restype = wintypes.HANDLE
+        process = ctypes.windll.kernel32.OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION,
+            False,
+            process_id.value,
+        )
+        if not process:
+            return ""
+
+        try:
+            size = wintypes.DWORD(32768)
+            buffer = ctypes.create_unicode_buffer(size.value)
+            if not ctypes.windll.kernel32.QueryFullProcessImageNameW(
+                process,
+                0,
+                buffer,
+                ctypes.byref(size),
+            ):
+                return ""
+            return Path(buffer.value).name.casefold()
+        finally:
+            ctypes.windll.kernel32.CloseHandle(process)
+
+    def _special_platform_kind(self, hwnd, window_class=None):
+        """Identify only window types whose visible frame differs materially."""
+        window_class = window_class or self._window_class_name(hwnd)
+        class_name = window_class.casefold()
+
+        if class_name == "taskmanagerwindow":
+            return "task-manager"
+
+        title = self._window_title(hwnd).strip().casefold()
+        if title in {"task manager", "windows task manager"}:
+            return "task-manager"
+
+        # ApplicationFrameHost owns the top-level HWND on older Settings
+        # versions, so the process alone cannot distinguish it from other
+        # hosted apps. Keep this fallback deliberately title-specific.
+        settings_classes = {
+            "applicationframewindow",
+            "winuidesktopwin32windowclass",
+        }
+        if class_name in settings_classes:
+            if title == "settings":
+                return "settings"
+            if self._window_process_name(hwnd) == "systemsettings.exe":
+                return "settings"
+
+        return None
+
+    def _live_exposure_failure_limit(self, hwnd):
+        """Return consecutive failed hit-tests required to leave a platform.
+
+        Task Manager can produce an isolated false WindowFromPoint result while
+        its elevated non-client window reorders.  Debounce that transient, but
+        continue checking it so a genuinely covering window wins normally.
+        """
+        if self._special_platform_kind(hwnd) == "task-manager":
+            return 3
+        return 1
+
+    def _live_exposure_probe_inset(self, hwnd):
+        """Return the logical-pixel inset used for the platform hit-test.
+
+        Task Manager's DWM visible-frame top can sit on an unstable non-client
+        boundary after conversion on a scaled monitor.  Probe safely inside
+        its title bar while preserving the same WindowFromPoint z-order test.
+        """
+        if self._special_platform_kind(hwnd) == "task-manager":
+            return 8
+        return 1
+
+    def _native_platform_rect(self, hwnd):
+        """Return physical bounds, using visible frames only where required."""
+        rect = wintypes.RECT()
+        special_kind = self._special_platform_kind(hwnd)
+
+        if special_kind is not None:
+            DWMWA_EXTENDED_FRAME_BOUNDS = 9
+            try:
+                result = ctypes.windll.dwmapi.DwmGetWindowAttribute(
+                    hwnd,
+                    DWMWA_EXTENDED_FRAME_BOUNDS,
+                    ctypes.byref(rect),
+                    ctypes.sizeof(rect),
+                )
+                if (
+                    result == 0
+                    and rect.right > rect.left
+                    and rect.bottom > rect.top
+                ):
+                    return rect
+            except (AttributeError, OSError):
+                pass
+
+        if not ctypes.windll.user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+            return None
+        return rect
+
+    def _qt_point_to_native(self, x, y, mapping):
+        """Convert a collision-space point for a Win32 visibility query."""
+        native, logical = mapping
+        scale_x = (native.right - native.left) / logical.width()
+        scale_y = (native.bottom - native.top) / logical.height()
+        return wintypes.POINT(
+            round(native.left + (x - logical.left()) * scale_x),
+            round(native.top + (y - logical.top()) * scale_y),
+        )
+
     def is_window_cloaked(self, hwnd):
         if sys.platform != "win32":
             return False
@@ -644,11 +1422,67 @@ class Tama(QLabel):
         except Exception:
             return False
 
+    def ignore_platform_window(self, hwnd):
+        """Make one of Tama's own windows transparent to platform sensing."""
+        if hwnd:
+            self.ignored_platform_hwnds.add(int(hwnd))
+
+    def _is_ignored_platform_window(self, hwnd):
+        if not hwnd:
+            return False
+
+        hwnd = int(hwnd)
+        tama_hwnd = int(self.winId())
+        if hwnd == tama_hwnd or hwnd in self.ignored_platform_hwnds:
+            return True
+
+        if sys.platform != "win32":
+            return False
+
+        user32 = ctypes.windll.user32
+        root = user32.GetAncestor(hwnd, 2)
+        tama_root = user32.GetAncestor(tama_hwnd, 2) or tama_hwnd
+        return bool(
+            root
+            and (
+                int(root) == int(tama_root)
+                or int(root) in self.ignored_platform_hwnds
+            )
+        )
+
+    def _top_nonignored_window_at_point(self, point):
+        """Return the first real app window at point, looking through Tama UI."""
+        user32 = ctypes.windll.user32
+        user32.WindowFromPoint.restype = wintypes.HWND
+        user32.GetWindow.restype = wintypes.HWND
+
+        top_hwnd = user32.WindowFromPoint(point)
+        if not top_hwnd or not self._is_ignored_platform_window(top_hwnd):
+            return top_hwnd
+
+        top_root = user32.GetAncestor(top_hwnd, 2) or top_hwnd
+        hwnd = user32.GetWindow(top_root, 2)  # GW_HWNDNEXT
+        while hwnd:
+            rect = wintypes.RECT()
+            if (
+                not self._is_ignored_platform_window(hwnd)
+                and user32.IsWindowVisible(hwnd)
+                and not user32.IsIconic(hwnd)
+                and user32.GetWindowRect(hwnd, ctypes.byref(rect))
+                and rect.left <= point.x < rect.right
+                and rect.top <= point.y < rect.bottom
+            ):
+                return hwnd
+            hwnd = user32.GetWindow(hwnd, 2)
+
+        return None
+
     def is_window_exposed_at_x(
         self,
         hwnd,
         x,
-        window_top
+        window_top,
+        mapping,
     ):
         if sys.platform != "win32":
             return True
@@ -658,14 +1492,13 @@ class Tama(QLabel):
         user32.WindowFromPoint.restype = wintypes.HWND
         user32.GetAncestor.restype = wintypes.HWND
 
-        point = wintypes.POINT(
+        point = self._qt_point_to_native(
             x,
-            window_top + 1
+            window_top + self._live_exposure_probe_inset(hwnd),
+            mapping,
         )
 
-        top_hwnd = user32.WindowFromPoint(
-            point
-        )
+        top_hwnd = self._top_nonignored_window_at_point(point)
 
         if not top_hwnd:
             return False
@@ -692,6 +1525,62 @@ class Tama(QLabel):
             int(top_root)
             == int(candidate_root)
         )
+
+    def _window_platform_exposed_sample_x(
+        self,
+        hwnd,
+        tama_center_x,
+        window_left,
+        window_right,
+        window_top,
+        mapping,
+    ):
+        """Return a genuinely exposed landing sample near Tama, if any.
+
+        The centre remains the preferred collision point.  The small lateral
+        search is only used by window-platform landing and only within the
+        candidate window's real bounds.  Each alternate point goes through the
+        normal WindowFromPoint z-order check, which rejects fully hidden
+        windows and lets a foreground window win at every point it covers.
+        """
+        probe_left = max(
+            window_left,
+            tama_center_x - WINDOW_PLATFORM_EDGE_GRACE,
+        )
+        probe_right = min(
+            window_right,
+            tama_center_x + WINDOW_PLATFORM_EDGE_GRACE,
+        )
+
+        if probe_left > probe_right:
+            return None
+
+        primary_x = min(max(tama_center_x, window_left), window_right)
+        sample_xs = [primary_x]
+
+        for offset in range(
+            WINDOW_PLATFORM_EDGE_PROBE_STEP,
+            WINDOW_PLATFORM_EDGE_GRACE + 1,
+            WINDOW_PLATFORM_EDGE_PROBE_STEP,
+        ):
+            for sample_x in (primary_x - offset, primary_x + offset):
+                if probe_left <= sample_x <= probe_right:
+                    sample_xs.append(sample_x)
+
+        for sample_x in (probe_left, probe_right):
+            if sample_x not in sample_xs:
+                sample_xs.append(sample_x)
+
+        for sample_x in sample_xs:
+            if self.is_window_exposed_at_x(
+                hwnd,
+                sample_x,
+                window_top,
+                mapping,
+            ):
+                return sample_x
+
+        return None
 
     def find_window_surface_crossing(
         self,
@@ -725,6 +1614,15 @@ class Tama(QLabel):
             if hwnd == tama_hwnd:
                 return True
 
+            if self._is_ignored_platform_window(hwnd):
+                return True
+
+            if (
+                self.bonk_source_surface_hwnd is not None
+                and int(hwnd) == int(self.bonk_source_surface_hwnd)
+            ):
+                return True
+
             if not user32.IsWindowVisible(
                 hwnd
             ):
@@ -750,21 +1648,8 @@ class Tama(QLabel):
             if owner_hwnd == tama_hwnd:
                 return True
 
-            class_buffer = (
-                ctypes.create_unicode_buffer(
-                    256
-                )
-            )
-
-            user32.GetClassNameW(
-                hwnd,
-                class_buffer,
-                256
-            )
-
-            window_class = (
-                class_buffer.value
-            )
+            window_class = self._window_class_name(hwnd)
+            special_kind = self._special_platform_kind(hwnd, window_class)
 
             ignored_classes = {
                 "WinUIDesktopWin32WindowClass",
@@ -773,25 +1658,26 @@ class Tama(QLabel):
             if (
                 window_class
                 in ignored_classes
+                and special_kind is None
             ):
                 return True
 
-            rect = wintypes.RECT()
-
-            if not user32.GetWindowRect(
-                hwnd,
-                ctypes.byref(rect)
-            ):
+            platform_rect = self._window_rect_in_qt_coordinates(hwnd)
+            if platform_rect is None:
                 return True
+
+            left, top, right, bottom, mapping = platform_rect
 
             width = (
-                rect.right
-                - rect.left
+                right
+                - left
+                + 1
             )
 
             height = (
-                rect.bottom
-                - rect.top
+                bottom
+                - top
+                + 1
             )
 
             if (
@@ -801,36 +1687,40 @@ class Tama(QLabel):
                 return True
 
             if not (
-                rect.left
+                left - WINDOW_PLATFORM_EDGE_GRACE
                 <= tama_center_x
-                <= rect.right
+                <= right + WINDOW_PLATFORM_EDGE_GRACE
             ):
                 return True
 
             if not (
                 current_paw_y
-                <= rect.top
+                <= top
                 <= next_paw_y
             ):
                 return True
 
-            if not self.is_window_exposed_at_x(
+            exposed_sample_x = self._window_platform_exposed_sample_x(
                 hwnd,
                 tama_center_x,
-                rect.top
-            ):
+                left,
+                right,
+                top,
+                mapping,
+            )
+            if exposed_sample_x is None:
                 return True
 
             candidate = (
                 hwnd,
-                rect.top,
-                rect.left,
-                rect.right
+                top,
+                left,
+                right
             )
 
             if (
                 best_surface is None
-                or rect.top
+                or top
                 < best_surface[1]
             ):
                 best_surface = candidate
@@ -891,14 +1781,12 @@ class Tama(QLabel):
             self.fall_from_platform()
             return
 
-        rect = wintypes.RECT()
-
-        if not user32.GetWindowRect(
-            hwnd,
-            ctypes.byref(rect)
-        ):
+        platform_rect = self._window_rect_in_qt_coordinates(hwnd)
+        if platform_rect is None:
             self.fall_from_platform()
             return
+
+        left, top, right, _bottom, mapping = platform_rect
 
         tama_center_x = (
             self.x()
@@ -906,24 +1794,41 @@ class Tama(QLabel):
         )
 
         if not (
-            rect.left
+            left
             <= tama_center_x
-            <= rect.right
+            <= right
         ):
             self.fall_from_platform()
             return
 
-        if not self.is_window_exposed_at_x(
+        exposed_sample_x = self._window_platform_exposed_sample_x(
             hwnd,
             tama_center_x,
-            rect.top
-        ):
-            self.fall_from_platform()
-            return
+            left,
+            right,
+            top,
+            mapping,
+        )
+        if exposed_sample_x is None:
+            self.live_exposure_failures += 1
+            if (
+                self.live_exposure_failures
+                >= self._live_exposure_failure_limit(hwnd)
+            ):
+                self.fall_from_platform()
+                return
+        else:
+            self.live_exposure_failures = 0
 
-        self.current_surface_y = rect.top
-        self.current_surface_left = rect.left
-        self.current_surface_right = rect.right
+        self.current_surface_y = top
+        self.current_surface_left = left
+        self.current_surface_right = right
+
+        if (
+            self.interaction_target is not None
+            and self.walk_timer.isActive()
+        ):
+            Tama._update_interaction_departure_target(self)
 
         current_sprite = self.pixmap()
 
@@ -974,6 +1879,9 @@ class Tama(QLabel):
         ):
             self.is_carrying = True
             self.is_falling = False
+            self.is_post_land_recovery = False
+            self.bonk_drop_pending = False
+            self.bonk_source_surface_hwnd = None
             self.is_sleeping = False
             self.is_waking = False
 
@@ -1108,6 +2016,8 @@ class Tama(QLabel):
                 self.current_surface_right
             ) = window_surface
 
+            self.live_exposure_failures = 0
+
             self.move(
                 self.x(),
                 (
@@ -1117,6 +2027,7 @@ class Tama(QLabel):
             )
 
             self.is_falling = False
+            self.bonk_source_surface_hwnd = None
 
             self.land()
 
@@ -1141,6 +2052,7 @@ class Tama(QLabel):
             )
 
             self.is_falling = False
+            self.bonk_source_surface_hwnd = None
 
             self.land()
 
@@ -1156,6 +2068,15 @@ class Tama(QLabel):
     # -----------------------------------------------------
 
     def land(self):
+        # Landing owns the pose until pose_timer completes.  In particular, a
+        # queued idle/crouch/walk callback from the previous platform must not
+        # repaint the landing frame.
+        self.walk_timer.stop()
+        self.idle_timer.stop()
+        self.crouch_start_timer.stop()
+        self.crouch_timer.stop()
+        self.crouch_end_timer.stop()
+
         landing_sprite = (
             self.get_landing_sprite()
         )
@@ -1169,10 +2090,28 @@ class Tama(QLabel):
         )
 
         self.pose_timer.stop()
-        self.pose_timer.start(250)
+        if self.bonk_drop_pending:
+            self.bonk_drop_pending = False
+            self.is_post_land_recovery = True
+            self.pose_timer.start(BONK_LANDING_RECOVERY_MS)
+        else:
+            self.pose_timer.start(250)
 
     def finish_landing(self):
+        # A platform can disappear during the landing pause.  fall_from_platform
+        # stops pose_timer, but an already queued timeout must also be harmless.
+        if self.is_falling:
+            return
+
+        self.is_post_land_recovery = False
+
         if self.interaction_target is not None:
+            # Food and bed live on the taskbar.  A window encountered on the
+            # way down is only an intermediate landing, not arrival.
+            if not self._interaction_surface_ready():
+                self.start_interaction_departure()
+                return
+
             self.start_interaction_walk()
             return
 
@@ -1379,6 +2318,11 @@ class Tama(QLabel):
         if (
             self.is_carrying
             or self.is_falling
+            or self.is_sleeping
+            or self.is_waking
+            or self.is_eating
+            or self.interaction_target is not None
+            or self.walk_timer.isActive()
         ):
             return
 
@@ -1434,6 +2378,7 @@ class Tama(QLabel):
         if (
             self.is_carrying
             or self.is_falling
+            or self.walk_timer.isActive()
         ):
             self.crouch_timer.stop()
             return
@@ -1460,6 +2405,15 @@ class Tama(QLabel):
 
     def finish_crouch(self):
         self.crouch_timer.stop()
+
+        if (
+            self.is_carrying
+            or self.is_falling
+            or self.walk_timer.isActive()
+            or self.interaction_target is not None
+        ):
+            return
+
         self.sit_front()
 
     # -----------------------------------------------------
@@ -1650,6 +2604,21 @@ class Tama(QLabel):
     # INTERACTION SEEKING
     # -----------------------------------------------------
 
+    def _interaction_surface_ready(self):
+        """Return whether Tama is stably standing on the target taskbar."""
+        if self.interaction_target is None or self.is_falling:
+            return False
+
+        if self.current_surface_y is not None:
+            return False
+
+        current_sprite = self.pixmap()
+        if current_sprite is None or current_sprite.isNull():
+            return False
+
+        paw_y = self.y() + self.find_visible_bottom(current_sprite)
+        return abs(paw_y - self.get_taskbar_ground()) <= 2
+
     def seek_interaction(self, interaction_type, target_x, interaction_ui=None):
         """Stop normal idle behaviour and go to a spawned object."""
 
@@ -1672,19 +2641,72 @@ class Tama(QLabel):
         self.walk_timer.stop()
         self.walk_target_x = None
 
-        # If Tama is standing on a program window,
-        # get her down toward the taskbar first.
+        # If Tama is standing on a program window, walk clear of its nearest
+        # edge before falling. Dropping in place lets gravity immediately
+        # rediscover the same window and creates a fall/land loop.
         if self.current_surface_y is not None:
-            self.fall_from_platform()
+            self.start_interaction_departure()
             return
 
         self.start_interaction_walk()
 
+    def start_interaction_departure(self):
+        """Walk off whichever edge of the current platform is closest."""
+        if (
+            self.interaction_target is None
+            or self.is_falling
+            or self.is_post_land_recovery
+        ):
+            return
+
+        if (
+            self.current_surface_y is None
+            or self.current_surface_left is None
+            or self.current_surface_right is None
+        ):
+            self.fall_from_platform()
+            return
+
+        tama_center_x = self.x() + (self.width() // 2)
+        distance_to_left = abs(tama_center_x - self.current_surface_left)
+        distance_to_right = abs(self.current_surface_right - tama_center_x)
+
+        if distance_to_left <= distance_to_right:
+            direction = "left"
+        else:
+            direction = "right"
+
+        self.start_walk(direction)
+        self.walk_direction = direction
+        Tama._update_interaction_departure_target(self)
+
+    def _update_interaction_departure_target(self):
+        """Keep an interaction drop point attached to its moving platform."""
+        if self.walk_direction == "left":
+            self.walk_target_x = (
+                self.current_surface_left
+                - (self.width() // 2)
+                - 10
+            )
+        else:
+            self.walk_target_x = (
+                self.current_surface_right
+                - (self.width() // 2)
+                + 10
+            )
+
     def start_interaction_walk(self):
-        if self.interaction_target is None:
+        if self.interaction_target is None or self.is_post_land_recovery:
             return
 
         if self.interaction_target_x is None:
+            return
+
+        if not self._interaction_surface_ready():
+            if self.current_surface_y is not None:
+                self.start_interaction_departure()
+            elif not self.is_falling:
+                self.fall_from_platform()
             return
 
         # Aim Tama's centre roughly at the object's centre.
@@ -1718,6 +2740,11 @@ class Tama(QLabel):
     def finish_interaction_walk(self):
         self.walk_timer.stop()
         self.walk_target_x = None
+
+        if not self._interaction_surface_ready():
+            if not self.is_falling:
+                self.fall_from_platform()
+            return
 
         # Food begins its eating animation immediately.
         if self.interaction_target == "food":
@@ -1769,6 +2796,11 @@ class Tama(QLabel):
     # -----------------------------------------------------
 
     def start_eating(self):
+        if not self._interaction_surface_ready():
+            if not self.is_falling:
+                self.fall_from_platform()
+            return
+
         self.walk_timer.stop()
         self.idle_timer.stop()
 
@@ -1893,8 +2925,16 @@ class Tama(QLabel):
             or self.is_falling
             or self.is_sleeping
             or self.is_waking
+            or self.is_post_land_recovery
         ):
             return
+
+        # A delayed idle/crouch callback must not be allowed to replace walk
+        # frames after walking has begun.
+        self.idle_timer.stop()
+        self.crouch_start_timer.stop()
+        self.crouch_timer.stop()
+        self.crouch_end_timer.stop()
 
         self.walk_direction = direction
         self.facing_direction = direction
@@ -1969,21 +3009,33 @@ class Tama(QLabel):
         else:
             self.sit_right()
 
-    def fall_from_platform(self):
+    def fall_from_platform(self, bonk_navigation=False):
         if self.is_falling:
             return
 
-        if (
-            self.current_surface_hwnd is not None
-            and (
-                self.crouch_timer.isActive()
-                or self.crouch_end_timer.isActive()
-            )
-        ):
-            return
-
+        # Falling has priority over every ground pose.  Commit the state and
+        # cancel all callbacks which could repaint or reposition Tama.
+        self.is_falling = True
+        self.is_post_land_recovery = False
+        # Remember the window Tama is leaving for every kind of platform
+        # drop.  The landing scan must not immediately rediscover that same
+        # window at its edge and bounce between falling and landing.  Actual
+        # bonks still use bonk_drop_pending for their longer recovery pose.
+        self.bonk_source_surface_hwnd = self.current_surface_hwnd
+        if bonk_navigation:
+            self.bonk_drop_pending = True
+        self.pose_timer.stop()
         self.walk_timer.stop()
         self.idle_timer.stop()
+
+        self.crouch_start_timer.stop()
+        self.crouch_timer.stop()
+        self.crouch_end_timer.stop()
+
+        self.sleep_timer.stop()
+        self.sleep_end_timer.stop()
+        self.is_sleeping = False
+        self.is_waking = False
 
         self.walk_target_x = None
 
@@ -1998,12 +3050,11 @@ class Tama(QLabel):
             self.y() + 2
         )
 
-        self.is_falling = True
-
     def animate_walk(self):
         if (
             self.is_carrying
             or self.is_falling
+            or self.is_post_land_recovery
         ):
             self.walk_timer.stop()
             return
@@ -2052,11 +3103,16 @@ class Tama(QLabel):
             is not None
         ):
 
-            if self.walk_direction == "left":
-                new_x = (
-                    self.x() - 10
-                )
+            new_x = self.x() - 10 if self.walk_direction == "left" else self.x() + 10
 
+            if (
+                self.interaction_target is not None
+                and self._would_cross_mixed_dpi_boundary(new_x, self.y())
+            ):
+                self.fall_from_platform(bonk_navigation=True)
+                return
+
+            if self.walk_direction == "left":
                 new_center_x = (
                     new_x
                     + (self.width() // 2)
@@ -2064,21 +3120,22 @@ class Tama(QLabel):
 
                 if (
                     new_center_x
-                    < self.current_surface_left
+                    <= self.current_surface_left - WINDOW_PLATFORM_EDGE_GRACE
                 ):
-                    self.move(
+                    moved = self._move_during_walk(
                         new_x,
                         self.y()
                     )
 
-                    self.fall_from_platform()
+                    if moved:
+                        self.fall_from_platform()
                     return
 
                 if (
                     new_x
                     <= self.walk_target_x
                 ):
-                    self.move(
+                    self._move_during_walk(
                         self.walk_target_x,
                         self.y()
                     )
@@ -2087,10 +3144,6 @@ class Tama(QLabel):
                     return
 
             else:
-                new_x = (
-                    self.x() + 10
-                )
-
                 new_center_x = (
                     new_x
                     + (self.width() // 2)
@@ -2098,21 +3151,22 @@ class Tama(QLabel):
 
                 if (
                     new_center_x
-                    > self.current_surface_right
+                    > self.current_surface_right + WINDOW_PLATFORM_EDGE_GRACE
                 ):
-                    self.move(
+                    moved = self._move_during_walk(
                         new_x,
                         self.y()
                     )
 
-                    self.fall_from_platform()
+                    if moved:
+                        self.fall_from_platform()
                     return
 
                 if (
                     new_x
                     >= self.walk_target_x
                 ):
-                    self.move(
+                    self._move_during_walk(
                         self.walk_target_x,
                         self.y()
                     )
@@ -2120,7 +3174,7 @@ class Tama(QLabel):
                     self.stop_walking()
                     return
 
-            self.move(
+            self._move_during_walk(
                 new_x,
                 self.y()
             )
@@ -2146,7 +3200,7 @@ class Tama(QLabel):
                 new_x
                 <= self.walk_target_x
             ):
-                self.move(
+                self._move_during_walk(
                     self.walk_target_x,
                     self.y()
                 )
@@ -2158,7 +3212,7 @@ class Tama(QLabel):
                 new_x
                 <= desktop_left
             ):
-                self.move(
+                self._move_during_walk(
                     desktop_left,
                     self.y()
                 )
@@ -2181,7 +3235,7 @@ class Tama(QLabel):
                 new_x
                 >= self.walk_target_x
             ):
-                self.move(
+                self._move_during_walk(
                     self.walk_target_x,
                     self.y()
                 )
@@ -2193,7 +3247,7 @@ class Tama(QLabel):
                 new_x
                 >= right_edge
             ):
-                self.move(
+                self._move_during_walk(
                     right_edge,
                     self.y()
                 )
@@ -2201,7 +3255,7 @@ class Tama(QLabel):
                 self.stop_walking()
                 return
 
-        self.move(
+        self._move_during_walk(
             new_x,
             self.y()
         )
@@ -2209,6 +3263,25 @@ class Tama(QLabel):
 
 def main():
     app = QApplication(sys.argv)
+
+    dpi_log(
+        f"START executable={sys.executable!r} frozen={getattr(sys, 'frozen', False)} "
+        f"pid={os.getpid()} pyside={__import__('PySide6').__version__} "
+        f"{windows_dpi_context()}"
+    )
+    for screen in QApplication.screens():
+        geometry = screen.geometry()
+        available = screen.availableGeometry()
+        dpi_log(
+            f"SCREEN name={screen.name()!r} "
+            f"geometry={geometry.x()},{geometry.y()},"
+            f"{geometry.width()}x{geometry.height()} "
+            f"available={available.x()},{available.y()},"
+            f"{available.width()}x{available.height()} "
+            f"dpr={screen.devicePixelRatio():g} "
+            f"logical_dpi={screen.logicalDotsPerInch():g} "
+            f"physical_dpi={screen.physicalDotsPerInch():g}"
+        )
 
     signal.signal(
         signal.SIGINT,
@@ -2223,6 +3296,7 @@ def main():
 
     tama = Tama()
     tama.show()
+    tama._log_dpi_state("shown")
 
     saved_tama = state.get(
         "tama",
@@ -2308,6 +3382,7 @@ def main():
         )
 
     tama_ui.show()
+    tama.ignore_platform_window(int(tama_ui.winId()))
 
     # -------------------------------------------------
     # SAVE MEMORY WHEN TAMA CLOSES

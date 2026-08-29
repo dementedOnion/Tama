@@ -3,7 +3,7 @@ import random
 import sys
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import QEvent, Qt, QTimer
 from PySide6.QtGui import QMouseEvent, QPainter, QPixmap
 from PySide6.QtWidgets import QApplication, QWidget
 
@@ -189,6 +189,11 @@ class TamaUI(QWidget):
             / "ui_close"
         )
 
+        minimize_buttons = (
+            ui_root
+            / "ui_minimize"
+        )
+
         self.button_pixmaps = {
             "left": (
                 self._load(
@@ -231,6 +236,17 @@ class TamaUI(QWidget):
                 self._load(
                     close_buttons
                     / "ui_close_pressed.png"
+                ),
+            ),
+
+            "minimize": (
+                self._load(
+                    minimize_buttons
+                    / "ui_min.png"
+                ),
+                self._load(
+                    minimize_buttons
+                    / "ui_min_pressed.png"
                 ),
             ),
         }
@@ -290,9 +306,9 @@ class TamaUI(QWidget):
         # -------------------------------------------------
 
         self.setWindowFlags(
-            Qt.FramelessWindowHint
+            Qt.Window
+            | Qt.FramelessWindowHint
             | Qt.WindowStaysOnTopHint
-            | Qt.Tool
         )
 
         self.setAttribute(
@@ -532,6 +548,22 @@ class TamaUI(QWidget):
                 return
 
             # -----------------------------------------
+            # MINIMIZE TAMAGOTCHI UI ONLY
+            # -----------------------------------------
+
+            if button == "minimize":
+                self.pressed_button = "minimize"
+                self.update()
+
+                QTimer.singleShot(
+                    self.PRESS_DURATION_MS,
+                    self._minimize_ui,
+                )
+
+                event.accept()
+                return
+
+            # -----------------------------------------
             # NORMAL UI BUTTONS
             # -----------------------------------------
 
@@ -590,6 +622,27 @@ class TamaUI(QWidget):
 
         if application is not None:
             application.quit()
+
+    # -----------------------------------------------------
+    # MINIMIZE TAMAGOTCHI UI ONLY
+    # -----------------------------------------------------
+
+    def _minimize_ui(self):
+        self.pressed_button = None
+        self.update()
+        self.showMinimized()
+
+    def changeEvent(self, event):
+        if event.type() == QEvent.WindowStateChange:
+            if self.pressed_button == "minimize":
+                self.pressed_button = None
+
+            if self.active_button == "minimize":
+                self.active_button = None
+
+            self.update()
+
+        super().changeEvent(event)
 
     # -----------------------------------------------------
     # TASKBAR OBJECT SPAWNING
