@@ -8,6 +8,8 @@ build_runtime/
 dist312/
 testing_build/
 testing_dist/
+release/
+release_staging/
 diagnostic_build/
 diagnostic_dist/
 *_diagnostic_build/
