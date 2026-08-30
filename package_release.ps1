@@ -1,14 +1,12 @@
 $ErrorActionPreference = "Stop"
 
 $projectRoot = $PSScriptRoot
-$git = (Get-Command git -ErrorAction Stop).Source
 $testerDirectory = Join-Path $projectRoot "Testers"
 $testerExecutable = Join-Path $testerDirectory "Tama.exe"
 $testerNotes = Join-Path $testerDirectory "Testers Read This.txt"
 $releaseDirectory = Join-Path $projectRoot "release"
 $stagingDirectory = Join-Path $projectRoot "release_staging"
 $packageRoot = Join-Path $stagingDirectory "Tama"
-$sourceRoot = Join-Path $packageRoot "Tama-main"
 $releaseArchive = Join-Path $releaseDirectory "Tama.zip"
 
 function Format-Size([long]$bytes) {
@@ -25,41 +23,16 @@ foreach ($requiredFile in @($testerExecutable, $testerNotes)) {
     }
 }
 
-Push-Location $projectRoot
 try {
     if (Test-Path -LiteralPath $stagingDirectory) {
         Remove-Item -LiteralPath $stagingDirectory -Recurse -Force
     }
 
-    New-Item -ItemType Directory -Path $sourceRoot -Force | Out-Null
+    New-Item -ItemType Directory -Path $packageRoot -Force | Out-Null
     New-Item -ItemType Directory -Path $releaseDirectory -Force | Out-Null
 
     Copy-Item -LiteralPath $testerExecutable -Destination $packageRoot
     Copy-Item -LiteralPath $testerNotes -Destination $packageRoot
-
-    # Git supplies the allowlist, including intentional untracked source/assets
-    # from the current working tree while still excluding ignored build output
-    # and local environment files. Missing paths remain tracked deletions.
-    $sourceFiles = & $git -C $projectRoot ls-files --cached --others --exclude-standard
-    if ($LASTEXITCODE -ne 0) {
-        throw "Git could not list the working-tree source files."
-    }
-
-    foreach ($relativePath in $sourceFiles) {
-        if ($relativePath -like "Testers/*") {
-            continue
-        }
-
-        $sourcePath = Join-Path $projectRoot $relativePath
-        if (-not (Test-Path -LiteralPath $sourcePath -PathType Leaf)) {
-            continue
-        }
-
-        $destinationPath = Join-Path $sourceRoot $relativePath
-        $destinationDirectory = Split-Path -Parent $destinationPath
-        New-Item -ItemType Directory -Path $destinationDirectory -Force | Out-Null
-        Copy-Item -LiteralPath $sourcePath -Destination $destinationPath
-    }
 
     if (Test-Path -LiteralPath $releaseArchive) {
         Remove-Item -LiteralPath $releaseArchive -Force
@@ -82,16 +55,9 @@ try {
     Write-Host "Package tree:"
     Write-Host "Tama/"
     Write-Host "|-- Tama.exe"
-    Write-Host "|-- Testers Read This.txt"
-    Write-Host "+-- Tama-main/"
-
-    Get-ChildItem -LiteralPath $sourceRoot -Recurse -File |
-        ForEach-Object { $_.FullName.Substring($sourceRoot.Length + 1).Replace("\", "/") } |
-        Sort-Object |
-        ForEach-Object { Write-Host "    |-- $_" }
+    Write-Host "+-- Testers Read This.txt"
 }
 finally {
-    Pop-Location
     if (Test-Path -LiteralPath $stagingDirectory) {
         Remove-Item -LiteralPath $stagingDirectory -Recurse -Force
     }
